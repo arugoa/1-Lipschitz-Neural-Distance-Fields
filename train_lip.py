@@ -62,7 +62,8 @@ if __name__ == "__main__":
     )
 
     # dataset parameters
-    parser.add_argument("dataset", type=str, default="", help="name of the dataset to train on")
+    parser.add_argument("dataset", type=str, default="../dataset-good", help="name of the dataset to train on")
+    parser.add_argument("-a", "--autoencoder", type=str, default="../experiments/train_autoencoder_shapes/shapes_navi/2026-02-16_14-04-35/logs/version_0/checkpoints/train_autoencoder_shapes-epoch=59-valid_loss=0.000644.ckpt", help="path to trained autoencoder")
     parser.add_argument("-o", "--output-name", type=str, default="training_data", help="custom output folder name")
     parser.add_argument("--unsigned", action="store_true", help="flag for training an unsigned distance field instead of a signed one")
 
@@ -103,10 +104,10 @@ if __name__ == "__main__":
 
     print("Loading Autoencoder Model...")
 
-    ckpt_path = "../experiments/train_autoencoder_shapes/shapes_navi/2026-02-16_14-04-35/logs/version_0/checkpoints/train_autoencoder_shapes-epoch=59-valid_loss=0.000644.ckpt"
+    ckpt_path = args.autoencoder
     autoencoder = load_autoencoder(ckpt_path)
     autoencoder.eval()
-    dataset = "../dataset-good"
+    dataset = args.dataset
 
     X_train = []
     y_train = []
