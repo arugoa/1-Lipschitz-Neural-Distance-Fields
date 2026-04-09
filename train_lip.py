@@ -4,6 +4,8 @@ import glob
 from types import SimpleNamespace
 import argparse
 import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 import torch
 import torch.nn as nn
@@ -66,6 +68,7 @@ if __name__ == "__main__":
     parser.add_argument("-a", "--autoencoder", type=str, default="../experiments/train_autoencoder_shapes/shapes_navi/2026-02-16_14-04-35/logs/version_0/checkpoints/train_autoencoder_shapes-epoch=59-valid_loss=0.000644.ckpt", help="path to trained autoencoder")
     parser.add_argument("-o", "--output-name", type=str, default="training_data", help="custom output folder name")
     parser.add_argument("--unsigned", action="store_true", help="flag for training an unsigned distance field instead of a signed one")
+    parser.add_argument("-p", "--pca-dim", type=int, default=2, help="dimension of pca to take of data")
 
     # model parameters
     parser.add_argument("-model","--model", choices=["ortho", "sll"], default="sll", help="Which Lipschitz architecture to consider. 'SLL' is the one used in the paper. 'Ortho' is the Bjorck orthonormalization-based architecture of Anil et al. (2019)")
@@ -161,29 +164,50 @@ if __name__ == "__main__":
     )
     y_train = np.array(y_train)
     y_train = y_train.reshape(y_train.shape[0]*y_train.shape[1],-1)
+    y_train = y_train.reshape(y_train.shape[0]*y_train.shape[1])
 
     X_test = np.array(X_test)
     X_test = X_test.reshape(
         X_test.shape[0]*X_test.shape[2],
         -1
-    )
-    X_test = torch.from_numpy(X_test).cuda()
+    )    
     y_test = np.array(y_test)
     y_test = y_test.reshape(-1)
-    Y_test = torch.from_numpy(y_test).float().cuda()
+    Y_test = torch.from_numpy(2 * y_test -1).float().cuda()
+
+    X_train = X_train.reshape(-1, X_train.shape[-1])
+    X_test = X_test.reshape(-1, X_test.shape[-1])
 
     print("X_train:",X_train.shape)
     print("y_train:",y_train.shape)
+
+    # Normalize data
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # PCA of training data
+    pca = PCA(args.pca_dim)
+    
+    X_train = pca.fit_transform(X_train)
+    X_test = pca.transform(X_test)
+    X_test = torch.from_numpy(X_test).cuda()
+
+
+    print("After pca: ", X_train.shape)
 
     X_train_in = []
     X_train_out = []
 
     for i in range(X_train.shape[0]):
-        for j in range(X_train.shape[1]):
-            if y_train[i,j]:
-                X_train_in.append(X_train[i,j])
+            if y_train[i]:
+                X_train_in.append(X_train[i])
             else:
-                X_train_out.append(X_train[i,j])
+                X_train_out.append(X_train[i])
+
+    x_in_len = len(X_train_in)
+    x_out_len = len(X_train_out)
+    x_train_len = x_in_len + x_out_len
 
     X_train_in = torch.from_numpy(np.array(X_train_in)).cuda()
     X_train_out = torch.from_numpy(np.array(X_train_out)).cuda()
@@ -204,6 +228,7 @@ if __name__ == "__main__":
     print(f"Succesfully loaded test set: {X_test.shape}\n")
 
     DIM = X_train_out.shape[1]
+    print("Dimenionality: ", DIM)
 
     model = select_model(
         args.model,
@@ -218,9 +243,12 @@ if __name__ == "__main__":
     # ---------------------------------------------------
 
     if config.signed:
+        print("hi guys we're signed!")
+        print("X_in ratio: ", x_in_len/x_train_len)
+        print("X_out ratio: ", x_out_len/x_train_len)
         pc = point_cloud_from_arrays(
-            (X_train_in.detach().cpu(),-1.),
-            (X_train_out.detach().cpu(),1.)
+            (X_train_in.detach().cpu(),-1 / (x_out_len/x_train_len)),
+            (X_train_out.detach().cpu(),1 / (x_in_len/x_train_len))
         )
     else:
         pc = point_cloud_from_arrays(
@@ -252,6 +280,6 @@ if __name__ == "__main__":
         trainer.add_callbacks(*callbacks)
         trainer.train_lip_unsigned(model)
 
-    path = os.path.join("output/","model_kr_loss.pt")
+    path = os.path.join("output/", f"model_hkr_loss_{args.pca_dim}.pt")
 
     save_model(model,path)
