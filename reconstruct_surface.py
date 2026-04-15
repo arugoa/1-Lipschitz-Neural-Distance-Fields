@@ -114,11 +114,11 @@ if __name__ == "__main__":
     parser.add_argument("model")
     parser.add_argument("-o", "--output-name", default="reconstruction")
     parser.add_argument("-iso", "--isovalues", type=float, nargs="+", default=[0.0])
-    parser.add_argument("-res", "--resolution", type=int, default=100)
+    parser.add_argument("-res", "--resolution", type=int, default=10)
     parser.add_argument("-cpu", action="store_true")
     parser.add_argument("-bs", "--batch-size", type=int, default=5000)
     # parser.add_argument("-r", "--range", action="store_true", help="override the -iso argument and run marching cube for each iso in linspace(-0.1, 0.1, 21)")
-    parser.add_argument("-latent-dim", type=int, default=640)
+    parser.add_argument("-latent-dim", type=int, default=8192)
     args = parser.parse_args()
 
     device = get_device(args.cpu)
