@@ -4,7 +4,7 @@ import glob
 from types import SimpleNamespace
 import argparse
 import numpy as np
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.preprocessing import StandardScaler
 
 import torch
@@ -112,7 +112,8 @@ if __name__ == "__main__":
     autoencoder.eval()
     dataset = args.dataset
 
-    X_train = []
+    X_train_in = []
+    X_train_out = []
     y_train = []
     X_test = []
     y_test = []
@@ -122,113 +123,166 @@ if __name__ == "__main__":
     num_train = int(len(files)*0.8)
     print("Loading Dataset...")
 
-    imgs = []
-    acts = []
-    dones = []
+    # Pass 1: count samples to pre-allocate memmaps
+    print("Counting samples...")
+    n_in, n_out, n_test = 0, 0, 0
+    DIM = None
 
-    for i,file_path in enumerate(files):
-        if i % 100 == 0:
-            print("Episode:",i)
-
-        file = np.load(file_path,allow_pickle=True)
-        imgs.append(pad(file["images"]))
-        acts.append(pad(file["actions"]))
+    for i, file_path in enumerate(files):
+        file = np.load(file_path, allow_pickle=True)
         d = file["dones"]
-        d = np.where(d == 0, -1, 1)
-        dones.append(pad(d))
-
-        imgs_t = torch.from_numpy(np.stack(imgs)).cuda().float()
-        acts_t = torch.from_numpy(np.stack(acts)).cuda().float()
-
-        with torch.no_grad():
-            encoded_data = autoencoder.encode(imgs_t,acts_t)
-
-        encoded_data = encoded_data.detach().cpu()
+        d = np.where(d == 0, 1, -1)
+        d_padded = pad(d)  # shape (150,)
+        if DIM is None:
+            DIM = 5*128  # known from encoder output
 
         if i < num_train:
-            X_train.append(encoded_data)
-            y_train.append(torch.from_numpy(np.array(dones)))
+            n_in  += int((d_padded == 1).sum())
+            n_out += int((d_padded != 1).sum())
         else:
-            X_test.append(encoded_data)
-            y_test.append(torch.from_numpy(np.array(dones)))
+            n_test += 150
 
-        imgs = []
-        acts = []
-        dones = []
+    print(f"n_in={n_in}, n_out={n_out}, n_test={n_test}")
 
-    X_train = np.array(X_train)
-    X_train = X_train.reshape(
-        X_train.shape[0],
-        X_train.shape[2],
-        -1
-    )
-    y_train = np.array(y_train)
-    y_train = y_train.reshape(y_train.shape[0]*y_train.shape[1],-1)
-    y_train = y_train.reshape(y_train.shape[0]*y_train.shape[1])
+    print("Fitting scaler + PCA (streaming)...")
+    pca_dim = args.pca_dim
+    ipca = []
+    scaler = []
+    for i in range(5):
+        ipca.append(IncrementalPCA(n_components=pca_dim, batch_size=1024))
+        scaler.append(StandardScaler())
 
-    X_test = np.array(X_test)
-    X_test = X_test.reshape(
-        X_test.shape[0]*X_test.shape[2],
-        -1
-    )    
-    y_test = np.array(y_test)
-    y_test = y_test.reshape(-1)
-    Y_test = torch.from_numpy(2 * y_test -1).float().cuda()
+    for i, file_path in enumerate(files):
+        if i % 100 == 0:
+            print(f"PCA Fit Episode: {i}")
+        
+        if i >= num_train:
+            break
 
-    X_train = X_train.reshape(-1, X_train.shape[-1])
-    X_test = X_test.reshape(-1, X_test.shape[-1])
+        file = np.load(file_path, allow_pickle=True)
 
-    print("X_train:",X_train.shape)
-    print("y_train:",y_train.shape)
+        imgs_np = pad(file["images"])
+        acts_np = pad(file["actions"])
 
-    # Normalize data
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+        imgs_t = torch.from_numpy(imgs_np[None]).float().to(config.device)
+        acts_t = torch.from_numpy(acts_np[None]).float().to(config.device)
+        # obs = {"image": imgs_t, "actions": acts_t}
 
-    # PCA of training data
-    pca = PCA(args.pca_dim)
-    
-    X_train = pca.fit_transform(X_train)
-    X_test = pca.transform(X_test)
-    X_test = torch.from_numpy(X_test).cuda()
+        with torch.no_grad():
+            encoded = autoencoder.encode(imgs_t, acts_t)
+
+        enc_np = encoded[0].detach().cpu().float().numpy().reshape(150, 640)
+
+        # --- fit scaler + PCA ---
+        for k in range(5):
+            scaler[k].partial_fit(enc_np[..., 128*k:128*(k+1)])
+            enc_np_scaled = scaler[k].transform(enc_np[..., 128*k:128*(k+1)])
+            ipca[k].partial_fit(enc_np_scaled)
+
+        del imgs_t, acts_t, encoded
+        torch.cuda.empty_cache()
+
+    print("Finished PCA fitting")
+    for k in range(5):
+        print("Explained variance ratio:", ipca[k].explained_variance_ratio_.sum())
+
+    # Update DIM AFTER PCA
+    DIM = 5 * pca_dim
+
+    # Allocate memmaps (NOW using PCA dim)
+    mm_path_in   = os.path.join(config.output_folder, "X_train_in.npy")
+    mm_path_out  = os.path.join(config.output_folder, "X_train_out.npy")
+    mm_path_test = os.path.join(config.output_folder, "X_test.npy")
+    mm_path_yt   = os.path.join(config.output_folder, "y_test.npy")
+
+    mm_in   = np.lib.format.open_memmap(mm_path_in,   mode="w+", dtype="float32", shape=(n_in,  DIM))
+    mm_out  = np.lib.format.open_memmap(mm_path_out,  mode="w+", dtype="float32", shape=(n_out, DIM))
+    mm_test = np.lib.format.open_memmap(mm_path_test, mode="w+", dtype="float32", shape=(n_test, DIM))
+    mm_yt   = np.lib.format.open_memmap(mm_path_yt,   mode="w+", dtype="float32", shape=(n_test,))
 
 
-    print("After pca: ", X_train.shape)
+    # PASS 2B: Encode → scale → PCA → write
+    print("Transforming with PCA and writing memmaps...")
+    idx_in, idx_out, idx_test = 0, 0, 0
 
-    X_train_in = []
-    X_train_out = []
+    for i, file_path in enumerate(files):
+        if i % 100 == 0:
+            print(f"Episode: {i}")
 
-    for i in range(X_train.shape[0]):
-            if y_train[i]:
-                X_train_in.append(X_train[i])
-            else:
-                X_train_out.append(X_train[i])
+        file = np.load(file_path, allow_pickle=True)
 
-    x_in_len = len(X_train_in)
-    x_out_len = len(X_train_out)
-    x_train_len = x_in_len + x_out_len
+        imgs_np = pad(file["images"])
+        acts_np = pad(file["actions"])
+        d = file["dones"]
+        d = np.where(d == 0, 1, -1)
+        d_padded = pad(d)
 
-    X_train_in = torch.from_numpy(np.array(X_train_in)).cuda()
-    X_train_out = torch.from_numpy(np.array(X_train_out)).cuda()
+        # Encode
+        imgs_t = torch.from_numpy(imgs_np[None]).float().to(config.device)
+        acts_t = torch.from_numpy(acts_np[None]).float().to(config.device)
 
-    loader_in = DataLoader(
-        TensorDataset(X_train_in),
-        batch_size=config.batch_size,
-        shuffle=True
-    )
+        with torch.no_grad():
+            encoded = autoencoder.encode(imgs_t, acts_t)
 
-    loader_out = DataLoader(
-        TensorDataset(X_train_out),
-        batch_size=config.batch_size,
-        shuffle=True
-    )
+        enc_np = encoded[0].detach().cpu().float().numpy().reshape(150, 640)  # (150, 640)
 
-    test_loader = DataLoader(TensorDataset(X_test, Y_test), batch_size=config.test_batch_size)
-    print(f"Succesfully loaded test set: {X_test.shape}\n")
+        # enc_np = scaler.transform(enc_np)
+        # enc_np = ipca.transform(enc_np)  # (150, pca_dim)
+        transformed = []
+        for k in range(5):
+            enc_np_scaled = scaler[k].transform(enc_np[..., 128*k:128*(k+1)])
+            transformed.append(ipca[k].transform(enc_np_scaled))
+        
+        enc_np = np.concatenate(transformed, axis=1) # (150, 10)
 
-    DIM = X_train_out.shape[1]
-    print("Dimenionality: ", DIM)
+        if i < num_train:
+            mask_in = (d_padded == 1)
+            mask_out = ~mask_in
+
+            n_in_batch = mask_in.sum()
+            n_out_batch = mask_out.sum()
+
+            mm_in[idx_in:idx_in+n_in_batch] = enc_np[mask_in]
+            mm_out[idx_out:idx_out+n_out_batch] = enc_np[mask_out]
+
+            idx_in += n_in_batch
+            idx_out += n_out_batch
+        else:
+            chunk = len(d_padded)
+            mm_test[idx_test:idx_test + chunk] = enc_np
+            mm_yt[idx_test:idx_test + chunk] = d_padded.astype("float32")
+            idx_test += chunk
+
+        # cleanup
+        del imgs_t, acts_t, encoded
+        torch.cuda.empty_cache()
+
+    # Flush to disk
+    del mm_in, mm_out, mm_test, mm_yt
+
+    print(f"Final counts → in: {idx_in}, out: {idx_out}, test: {idx_test}")
+
+    # Re-open as read-only and wrap in TensorDataset/DataLoader
+    class MemmapDataset(torch.utils.data.Dataset):
+        def __init__(self, *paths, device="cpu"):
+            self.arrays = [np.load(p, mmap_mode="r") for p in paths]
+            self.device = device
+
+        def __len__(self):
+            return len(self.arrays[0])
+
+        def __getitem__(self, idx):
+            return tuple(
+                torch.from_numpy(np.array(a[idx])).to(self.device)
+                for a in self.arrays
+            )
+
+    loader_in  = DataLoader(MemmapDataset(mm_path_in, device=config.device),  batch_size=config.batch_size, shuffle=True)
+    loader_out = DataLoader(MemmapDataset(mm_path_out, device=config.device), batch_size=config.batch_size, shuffle=True)
+    test_ds    = MemmapDataset(mm_path_test, mm_path_yt, device=config.device)
+    test_loader = DataLoader(test_ds, batch_size=config.test_batch_size)
+
+    print(f"Train in: {idx_in}, Train out: {idx_out}, Test: {idx_test}")
 
     model = select_model(
         args.model,
@@ -244,17 +298,20 @@ if __name__ == "__main__":
 
     if config.signed:
         print("hi guys we're signed!")
-        print("X_in ratio: ", x_in_len/x_train_len)
-        print("X_out ratio: ", x_out_len/x_train_len)
+        # print("X_in ratio: ", x_in_len/x_train_len)
+        # print("X_out ratio: ", x_out_len/x_train_len)
+        X_pc_in  = torch.from_numpy(np.load(mm_path_in))
+        X_pc_out = torch.from_numpy(np.load(mm_path_out))
         pc = point_cloud_from_arrays(
-            (X_train_in.detach().cpu(),-1 / (x_out_len/x_train_len)),
-            (X_train_out.detach().cpu(),1 / (x_in_len/x_train_len))
+            (X_pc_in.detach().cpu(),-1 ),
+            (X_pc_out.detach().cpu(),1 )
         )
     else:
         pc = point_cloud_from_arrays(
             (X_train_out.detach().cpu(), 1.)
         )
     torch.save(pc, os.path.join(config.output_folder,"pc_0.pt"))
+    torch.save({"scaler": scaler, "ipca": ipca}, "pca.pt")
 
     # ---------------------------------------------------
     # Training callbacks
@@ -280,6 +337,6 @@ if __name__ == "__main__":
         trainer.add_callbacks(*callbacks)
         trainer.train_lip_unsigned(model)
 
-    path = os.path.join("output/", f"model_hkr_loss_{args.pca_dim}.pt")
+    path = os.path.join("output/", f"model_hkr_loss_{DIM}.pt")
 
     save_model(model,path)
