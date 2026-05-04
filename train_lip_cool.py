@@ -170,8 +170,8 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
 
     sampler_in  = WeightedRandomSampler(weights_in,  num_samples=int(n_safe),   replacement=True)
     sampler_out = WeightedRandomSampler(weights_out, num_samples=int(n_unsafe), replacement=True)
-    loader_in   = DataLoader(MemmapDataset(mm["X_train_in"],  device=device), batch_size=config.batch_size, shuffle=True, sampler=sampler_in)
-    loader_out  = DataLoader(MemmapDataset(mm["X_train_out"], device=device), batch_size=config.batch_size, shuffle=True, sampler=sampler_out)
+    loader_in   = DataLoader(MemmapDataset(mm["X_train_in"],  device=device), batch_size=config.batch_size, sampler=sampler_in)
+    loader_out  = DataLoader(MemmapDataset(mm["X_train_out"], device=device), batch_size=config.batch_size, sampler=sampler_out)
     test_loader = DataLoader(MemmapDataset(mm["X_test"], mm["y_test"], device=device), batch_size=config.test_batch_size)
 
     # ── 6. SDF model ──────────────────────────────────────────────────────
