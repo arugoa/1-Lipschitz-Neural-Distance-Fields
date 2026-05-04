@@ -39,11 +39,12 @@ def get_args():
     parser.add_argument("--unsigned", action="store_true")
 
     # encoder selection
-    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder"],
+    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm"],
                         default="cjepa", help="Which encoder to use")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
     parser.add_argument("--dreamer-ckpt", type=str, default=None)
     parser.add_argument("--autoencoder-ckpt", type=str, default=None)
+    parser.add_argument("--lewm-ckpt", type=str, default=None)
 
     # PCA — can pass multiple dims to train one model per dim
     parser.add_argument("-p", "--pca-dims", type=int, nargs="+", default=[3],
@@ -226,6 +227,8 @@ if __name__ == "__main__":
         enc_kwargs["checkpoint_path"] = args.dreamer_ckpt
     elif args.encoder == "autoencoder":
         enc_kwargs["checkpoint_path"] = args.autoencoder_ckpt
+    elif args.encoder == "lewm":
+        enc_kwargs["checkpoint_path"] = args.lewm_ckpt
 
     print(f"Loading encoder: {args.encoder} ...")
     encoder = build_encoder(args.encoder, **enc_kwargs)
