@@ -67,15 +67,6 @@ def get_args():
     return parser.parse_args()
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-def pad(arr, target_len=150):
-    T = arr.shape[0]
-    if T >= target_len:
-        return arr[:target_len]
-    return np.concatenate([arr, np.repeat(arr[-1:], target_len - T, axis=0)], axis=0)
-
-
 class MemmapDataset(torch.utils.data.Dataset):
     def __init__(self, *paths, device="cpu"):
         self.arrays = [np.load(p, mmap_mode="r") for p in paths]
@@ -104,7 +95,6 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     n_in = n_out = n_test = 0
     for i, fp in enumerate(files):
         d = np.where(np.load(fp, allow_pickle=True)["dones"] == 0, 1, -1)
-        d = pad(d)
         if i < num_train:
             n_in  += int((d ==  1).sum())
             n_out += int((d != 1).sum())
@@ -120,7 +110,7 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     for i, fp in enumerate(files[:num_train]):
         if i % 100 == 0:
             print(f"  PCA fit {i}/{num_train}")
-        imgs_np = pad(np.load(fp, allow_pickle=True)["images"])
+        imgs_np = np.load(fp, allow_pickle=True)["images"]
         enc_np  = encoder.encode(imgs_np, device)
         scaler.partial_fit(enc_np)
         ipca.partial_fit(scaler.transform(enc_np))
@@ -150,9 +140,8 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
         if i % 200 == 0:
             print(f"  Episode {i}/{len(files)}")
         file    = np.load(fp, allow_pickle=True)
-        imgs_np = pad(file["images"])
+        imgs_np = file["images"]
         d       = np.where(file["dones"] == 0, 1, -1)
-        d       = pad(d)
         enc_np  = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
 
         if i < num_train:

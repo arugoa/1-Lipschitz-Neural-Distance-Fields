@@ -41,13 +41,6 @@ def get_args():
     return parser.parse_args()
 
 
-def pad(arr, target_len=150):
-    T = arr.shape[0]
-    if T >= target_len:
-        return arr[:target_len]
-    return np.concatenate([arr, np.repeat(arr[-1:], target_len - T, axis=0)], axis=0)
-
-
 def evaluate(preds, y_test):
     tp = ((preds > 0) & (y_test > 0)).sum().item()
     fp = ((preds > 0) & (y_test <= 0)).sum().item()
@@ -113,9 +106,8 @@ if __name__ == "__main__":
         if i % 100 == 0:
             print(f"  Episode {i}/{len(test_files)}")
         file    = np.load(fp, allow_pickle=True)
-        imgs_np = pad(file["images"])
+        imgs_np = file["images"]
         d       = np.where(file["dones"] == 0, 1, -1)
-        d       = pad(d)
 
         enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
         enc_t  = torch.from_numpy(enc_np).float().to(device)
