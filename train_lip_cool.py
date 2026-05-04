@@ -51,7 +51,7 @@ def get_args():
                         help="PCA dimension(s). Pass multiple to train several models.")
 
     # SDF model
-    parser.add_argument("-model", "--model", choices=["ortho", "sll"], default="sll")
+    parser.add_argument("-model", "--model", choices=["ortho", "sll", "mlp"], default="sll")
     parser.add_argument("-n-layers", "--n-layers", type=int, default=20)
     parser.add_argument("-n-hidden", "--n-hidden", type=int, default=128)
 
@@ -177,19 +177,6 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     # ── 6. SDF model ──────────────────────────────────────────────────────
     model = select_model(args.model, pca_dim, args.n_layers, args.n_hidden).to(device)
     print(f"SDF parameters: {count_parameters(model)}")
-
-    # ── 7. Point cloud export ─────────────────────────────────────────────
-    if config.signed:
-        X_in  = torch.from_numpy(np.load(mm["X_train_in"]))
-        X_out = torch.from_numpy(np.load(mm["X_train_out"]))
-        pc = point_cloud_from_arrays((X_in, -1.), (X_out, 1.))
-        del X_in, X_out
-    else:
-        X_out = torch.from_numpy(np.load(mm["X_train_out"]))
-        pc    = point_cloud_from_arrays((X_out, 1.))
-        del X_out
-    torch.save(pc, os.path.join(out_folder, "pc_0.pt"))
-    del pc
 
     # ── 8. Train ──────────────────────────────────────────────────────────
     config.output_folder = out_folder  # point callbacks to per-run folder
