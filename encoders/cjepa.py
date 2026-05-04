@@ -27,7 +27,7 @@ SLOT_DIM  = 128
 
 class CJEPAEncoder(BaseEncoder):
     def __init__(self, checkpoint_path: str = 'clevrer_savi_model.pth'):
-        sys.path.append('src/third_party/slotformer')
+        sys.path.append('/home/arihant/projects/cjepa/src/third_party/slotformer')
         from base_slots.models.savi import StoSAVi
 
         model = StoSAVi(**_SAVI_CONFIG)

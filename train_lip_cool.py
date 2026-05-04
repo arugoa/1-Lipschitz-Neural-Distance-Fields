@@ -167,8 +167,8 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     weights_in  = torch.full((n_safe,),   1.0 / n_safe)
     weights_out = torch.full((n_unsafe,), 1.0 / n_unsafe)
 
-    sampler_in  = WeightedRandomSampler(weights_in,  num_samples=n_safe,   replacement=True)
-    sampler_out = WeightedRandomSampler(weights_out, num_samples=n_unsafe, replacement=True)
+    sampler_in  = WeightedRandomSampler(weights_in,  num_samples=int(n_safe),   replacement=True)
+    sampler_out = WeightedRandomSampler(weights_out, num_samples=int(n_unsafe), replacement=True)
     loader_in   = DataLoader(MemmapDataset(mm["X_train_in"],  device=device), batch_size=config.batch_size, shuffle=True, sampler=sampler_in)
     loader_out  = DataLoader(MemmapDataset(mm["X_train_out"], device=device), batch_size=config.batch_size, shuffle=True, sampler=sampler_out)
     test_loader = DataLoader(MemmapDataset(mm["X_test"], mm["y_test"], device=device), batch_size=config.test_batch_size)
