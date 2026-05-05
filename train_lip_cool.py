@@ -195,7 +195,7 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     else:
         trainer.train_lip_unsigned(model)
 
-    model_path = os.path.join(out_folder, f"model_hkr_loss_{pca_dim}.pt")
+    model_path = os.path.join(out_folder, f"model_hkr_loss_{pca_dim}_{args.model}.pt")
     save_model(model, model_path)
     print(f"Model saved to {model_path}")
 
