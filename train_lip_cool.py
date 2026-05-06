@@ -92,73 +92,90 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     print(f"  Output:  {out_folder}")
     print(f"{'='*60}")
 
-    # ── 1. Count samples ──────────────────────────────────────────────────
-    n_in = n_out = n_test = 0
-    for i, fp in enumerate(files):
-        d = np.where(np.load(fp, allow_pickle=True)["dones"] == 0, 1, -1)
-        if i < num_train:
-            n_in  += int((d ==  1).sum())
-            n_out += int((d != 1).sum())
-        else:
-            n_test += 150
-    print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
-
-    # ── 2. Fit scaler + PCA ───────────────────────────────────────────────
-    ipca   = IncrementalPCA(n_components=pca_dim, batch_size=1024)
-    scaler = StandardScaler()
-
-    print("Fitting scaler + PCA...")
-    for i, fp in enumerate(files[:num_train]):
-        if i % 100 == 0:
-            print(f"  PCA fit {i}/{num_train}")
-        imgs_np = np.load(fp, allow_pickle=True)["images"]
-        enc_np  = encoder.encode(imgs_np, device)
-        scaler.partial_fit(enc_np)
-        ipca.partial_fit(scaler.transform(enc_np))
-
-    print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
-
-    # Save PCA pipeline for use in test_sdf.py
-    pca_path = os.path.join(out_folder, "pca_pipeline.pkl")
-    with open(pca_path, "wb") as f:
-        pickle.dump({"scaler": scaler, "ipca": ipca}, f)
-    print(f"PCA pipeline saved to {pca_path}")
-
-    # ── 3. Allocate memmaps ───────────────────────────────────────────────
     mm = {k: os.path.join(out_folder, f"{k}.npy") for k in
           ["X_train_in", "X_train_out", "X_test", "y_test"]}
+    pca_path = os.path.join(out_folder, "pca_pipeline.pkl")
 
-    mm_in   = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_in,   pca_dim))
-    mm_out  = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_out,  pca_dim))
-    mm_test = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test, pca_dim))
-    mm_yt   = np.lib.format.open_memmap(mm["y_test"],      mode="w+", dtype="float32", shape=(n_test,))
+    data_ready = all(os.path.exists(p) for p in [*mm.values(), pca_path])
 
-    # ── 4. Encode → PCA → write ───────────────────────────────────────────
-    print("Encoding + writing memmaps...")
-    idx_in = idx_out = idx_test = 0
+    if data_ready:
+        print(f"Found existing memmaps and PCA pipeline in {out_folder}, skipping encoding.")
+        with open(pca_path, "rb") as f:
+            pca_data = pickle.load(f)
+        # Load counts from memmap shapes
+        n_in   = len(np.load(mm["X_train_in"],  mmap_mode="r"))
+        n_out  = len(np.load(mm["X_train_out"], mmap_mode="r"))
+        n_test = len(np.load(mm["X_test"],      mmap_mode="r"))
+        idx_in, idx_out, idx_test = n_in, n_out, n_test
+        print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
+    else:
+        # ── 1. Count samples ──────────────────────────────────────────────────
+        n_in = n_out = n_test = 0
+        for i, fp in enumerate(files):
+            d = np.where(np.load(fp, allow_pickle=True)["dones"] == 0, 1, -1)
+            if i < num_train:
+                n_in  += int((d ==  1).sum())
+                n_out += int((d != 1).sum())
+            else:
+                n_test += 150
+        print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
 
-    for i, fp in enumerate(files):
-        if i % 200 == 0:
-            print(f"  Episode {i}/{len(files)}")
-        file    = np.load(fp, allow_pickle=True)
-        imgs_np = file["images"]
-        d       = np.where(file["dones"] == 0, 1, -1)
-        enc_np  = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
+        # ── 2. Fit scaler + PCA ───────────────────────────────────────────────
+        ipca   = IncrementalPCA(n_components=pca_dim, batch_size=1024)
+        scaler = StandardScaler()
 
-        if i < num_train:
-            mask_in  = (d == 1);  mask_out = ~mask_in
-            n_i = mask_in.sum();  n_o = mask_out.sum()
-            mm_in [idx_in :idx_in  + n_i] = enc_np[mask_in]
-            mm_out[idx_out:idx_out + n_o] = enc_np[mask_out]
-            idx_in += n_i;  idx_out += n_o
-        else:
-            chunk = len(d)
-            mm_test[idx_test:idx_test + chunk] = enc_np
-            mm_yt  [idx_test:idx_test + chunk] = d.astype("float32")
-            idx_test += chunk
+        print("Fitting scaler + PCA...")
+        for i, fp in enumerate(files[:num_train]):
+            if i % 100 == 0:
+                print(f"  PCA fit {i}/{num_train}")
+            imgs_np = np.load(fp, allow_pickle=True)["images"]
+            enc_np  = encoder.encode(imgs_np, device)
+            scaler.partial_fit(enc_np)
+            ipca.partial_fit(scaler.transform(enc_np))
 
-    del mm_in, mm_out, mm_test, mm_yt
-    print(f"Done → in: {idx_in}, out: {idx_out}, test: {idx_test}")
+        print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
+
+        # Save PCA pipeline for use in test_sdf.py
+        pca_path = os.path.join(out_folder, "pca_pipeline.pkl")
+        with open(pca_path, "wb") as f:
+            pickle.dump({"scaler": scaler, "ipca": ipca}, f)
+        print(f"PCA pipeline saved to {pca_path}")
+
+        # ── 3. Allocate memmaps ───────────────────────────────────────────────
+        mm = {k: os.path.join(out_folder, f"{k}.npy") for k in
+            ["X_train_in", "X_train_out", "X_test", "y_test"]}
+
+        mm_in   = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_in,   pca_dim))
+        mm_out  = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_out,  pca_dim))
+        mm_test = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test, pca_dim))
+        mm_yt   = np.lib.format.open_memmap(mm["y_test"],      mode="w+", dtype="float32", shape=(n_test,))
+
+        # ── 4. Encode → PCA → write ───────────────────────────────────────────
+        print("Encoding + writing memmaps...")
+        idx_in = idx_out = idx_test = 0
+
+        for i, fp in enumerate(files):
+            if i % 200 == 0:
+                print(f"  Episode {i}/{len(files)}")
+            file    = np.load(fp, allow_pickle=True)
+            imgs_np = file["images"]
+            d       = np.where(file["dones"] == 0, 1, -1)
+            enc_np  = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
+
+            if i < num_train:
+                mask_in  = (d == 1);  mask_out = ~mask_in
+                n_i = mask_in.sum();  n_o = mask_out.sum()
+                mm_in [idx_in :idx_in  + n_i] = enc_np[mask_in]
+                mm_out[idx_out:idx_out + n_o] = enc_np[mask_out]
+                idx_in += n_i;  idx_out += n_o
+            else:
+                chunk = len(d)
+                mm_test[idx_test:idx_test + chunk] = enc_np
+                mm_yt  [idx_test:idx_test + chunk] = d.astype("float32")
+                idx_test += chunk
+
+        del mm_in, mm_out, mm_test, mm_yt
+        print(f"Done → in: {idx_in}, out: {idx_out}, test: {idx_test}")
 
     # ── 5. DataLoaders ────────────────────────────────────────────────────
     n_safe   = idx_in   # frames where d == 1
