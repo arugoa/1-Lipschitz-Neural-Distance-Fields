@@ -84,7 +84,7 @@ class MemmapDataset(torch.utils.data.Dataset):
 def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
     """Run the full pipeline for one PCA dimension."""
 
-    run_name    = f"{args.encoder}_pca{pca_dim}"
+    run_name    = f"{args.encoder}_pca{pca_dim}_{args.model}"
     out_folder  = os.path.join("output", args.output_name, run_name)
     os.makedirs(out_folder, exist_ok=True)
     print(f"\n{'='*60}")
