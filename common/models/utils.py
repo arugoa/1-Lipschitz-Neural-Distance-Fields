@@ -13,7 +13,7 @@ def save_model(model, path):
     torch.save(data, path)
     
 def load_model(path, device:str):
-    data = torch.load(path, map_location=device)
+    data = torch.load(path, map_location=device, weights_only=False)
     model_type = data.get("id","Spectral")
     if model_type == "Spectral":
         model = DenseLipNetwork(*data["meta"])
