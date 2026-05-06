@@ -54,7 +54,10 @@ def plot_loss(run_dir):
 
     epoch_col = df.columns[0]  # assume first col is epoch
     for ax, col in zip(axes, df.columns[1:]):
-        ax.plot(df[epoch_col], df[col], linewidth=1.5)
+        series = df[col]
+        if series.dtype == object:
+            series = series.apply(lambda x: list(eval(x).values())[0] if isinstance(x, str) else list(x.values())[0])
+        ax.plot(df[epoch_col], series, linewidth=1.5)
         ax.set_xlabel("Epoch")
         ax.set_ylabel(col)
         ax.set_title(col.replace("_", " ").title())

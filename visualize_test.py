@@ -78,7 +78,7 @@ def compute_metrics(preds, labels):
 
 def plot_metrics(metrics, run_dir):
     keys   = ["accuracy", "precision", "recall", "f1"]
-    values = [metrics[k] * (100 if k == "accuracy" else 1) for k in keys]
+    values = [metrics[k] for k in keys]
     colors = ["#4c72b0", "#55a868", "#dd8452", "#c44e52"]
     labels = ["Accuracy (%)", "Precision", "Recall", "F1"]
 
@@ -243,18 +243,11 @@ if __name__ == "__main__":
     print(f"\nVisualizing test results for: {run}\n")
 
     # Load data
-    X_test  = np.load(os.path.join(run, "X_test.npy"),  mmap_mode="r")
-    y_test  = np.load(os.path.join(run, "y_test.npy"),  mmap_mode="r")
-    X_in    = np.load(os.path.join(run, "X_train_in.npy"),  mmap_mode="r")
-    X_out   = np.load(os.path.join(run, "X_train_out.npy"), mmap_mode="r")
-    pca_dim = X_test.shape[1]
-
-    sdf, model_path = load_sdf(run, args.model, device)
-
-    # Run predictions
-    print("Running SDF on test set...")
-    preds  = run_sdf(sdf, X_test, device)
-    labels = np.array(y_test)
+    preds_path  = os.path.join(run, "test_preds.npy")
+    labels_path = os.path.join(run, "test_labels.npy")
+    assert os.path.exists(preds_path), "Run test_sdf_cool.py first to generate test_preds.npy"
+    preds  = np.load(preds_path)
+    labels = np.load(labels_path)
 
     # Compute and print metrics
     metrics = compute_metrics(preds, labels)
@@ -272,6 +265,12 @@ if __name__ == "__main__":
     plot_confusion_matrix(metrics, run)
     plot_score_dist(preds, labels, run)
 
+    X_in  = np.load(os.path.join(run, "X_train_in.npy"),  mmap_mode="r")
+    X_out = np.load(os.path.join(run, "X_train_out.npy"), mmap_mode="r")
+    pca_dim = X_in.shape[1]
+
+    # Load SDF only for boundary plots
+    sdf, _ = load_sdf(run, args.model, device)
     if pca_dim == 2:
         plot_boundary_2d(sdf, X_in, X_out, run, device, args.n_sample)
     elif pca_dim >= 3:

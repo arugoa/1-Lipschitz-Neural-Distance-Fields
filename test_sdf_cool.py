@@ -124,5 +124,9 @@ if __name__ == "__main__":
     preds  = torch.cat(preds_all)
     labels = torch.cat(labels_all)
 
+    np.save(os.path.join(args.run_dir, "test_preds.npy"),  preds)
+    np.save(os.path.join(args.run_dir, "test_labels.npy"), labels)
+    print(f"Saved preds and labels to {args.run_dir}")
+
     print(f"\n── Results: {args.encoder} | {args.run_dir} ──")
     evaluate(preds, labels)
