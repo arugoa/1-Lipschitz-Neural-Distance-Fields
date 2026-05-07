@@ -112,8 +112,11 @@ if __name__ == "__main__":
         imgs_np = file["images"]
         d       = np.where(file["dones"] == 0, 1, -1)
 
-        enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
-        enc_t  = torch.from_numpy(enc_np).float().to(device)
+        if ipca is not None:
+            enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
+            enc_t  = torch.from_numpy(enc_np).float().to(device)
+        else:
+            enc_t = torch.from_numpy(encoder.encode(imgs_np, device)).float().to(device)
 
         with torch.no_grad():
             preds = sdf(enc_t).squeeze(-1).cpu()
