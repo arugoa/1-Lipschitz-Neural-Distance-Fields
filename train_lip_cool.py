@@ -2,9 +2,10 @@
 Unified SDF training script.
 
 Usage examples:
-    python train_lip.py ../dataset-good/ --encoder cjepa --pca-dim 3
-    python train_lip.py ../dataset-good/ --encoder dreamer --pca-dim 5 --dreamer-ckpt path/to/ckpt
-    python train_lip.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt
+    python train_lip_cool.py ../dataset-good/ --encoder cjepa --pca-dims 3
+    python train_lip_cool.py ../dataset-good/ --encoder dreamer --pca-dims 5 --dreamer-ckpt path/to/ckpt
+    python train_lip_cool.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt
+    python train_lip_cool.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt --no-pca
 """
 
 import os
@@ -43,12 +44,17 @@ def get_args():
                         default="cjepa", help="Which encoder to use")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
     parser.add_argument("--dreamer-ckpt", type=str, default=None)
+    parser.add_argument("--dreamer-configs", type=str, default="../configs.yaml")
     parser.add_argument("--autoencoder-ckpt", type=str, default=None)
     parser.add_argument("--lewm-ckpt", type=str, default=None)
 
-    # PCA — can pass multiple dims to train one model per dim
+    # PCA
     parser.add_argument("-p", "--pca-dims", type=int, nargs="+", default=[3],
-                        help="PCA dimension(s). Pass multiple to train several models.")
+                        help="PCA dimension(s). Pass multiple to train several models. Ignored if --no-pca.")
+    parser.add_argument("--no-pca", action="store_true",
+                        help="Skip PCA and use raw encoder output directly.")
+    parser.add_argument("--force-encode", action="store_true",
+                        help="Re-encode even if memmaps already exist.")
 
     # SDF model
     parser.add_argument("-model", "--model", choices=["ortho", "sll", "mlp"], default="sll")
@@ -81,14 +87,28 @@ class MemmapDataset(torch.utils.data.Dataset):
                      for a in self.arrays)
 
 
-def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
-    """Run the full pipeline for one PCA dimension."""
+def transform_enc(enc_np, scaler, ipca, no_pca):
+    """Apply scaler + PCA, or return raw if no_pca."""
+    if no_pca:
+        return enc_np.astype("float32")
+    return ipca.transform(scaler.transform(enc_np)).astype("float32")
 
-    run_name    = f"{args.encoder}_pca{pca_dim}_{args.model}"
-    out_folder  = os.path.join("output", args.output_name, run_name)
+
+# ── Main training function ─────────────────────────────────────────────────
+
+def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
+    """Run the full pipeline for one PCA dimension (or no PCA)."""
+
+    if args.no_pca:
+        pca_dim  = encoder.output_dim()
+        run_name = f"{args.encoder}_nopca_{args.model}"
+    else:
+        run_name = f"{args.encoder}_pca{pca_dim}_{args.model}"
+
+    out_folder = os.path.join("output", args.output_name, run_name)
     os.makedirs(out_folder, exist_ok=True)
     print(f"\n{'='*60}")
-    print(f"  Encoder: {args.encoder}   PCA dim: {pca_dim}")
+    print(f"  Encoder: {args.encoder}   PCA dim: {pca_dim}   no_pca: {args.no_pca}")
     print(f"  Output:  {out_folder}")
     print(f"{'='*60}")
 
@@ -96,20 +116,18 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
           ["X_train_in", "X_train_out", "X_test", "y_test"]}
     pca_path = os.path.join(out_folder, "pca_pipeline.pkl")
 
-    data_ready = all(os.path.exists(p) for p in [*mm.values(), pca_path])
+    data_ready = (not args.force_encode) and all(os.path.exists(p) for p in [*mm.values(), pca_path])
 
     if data_ready:
-        print(f"Found existing memmaps and PCA pipeline in {out_folder}, skipping encoding.")
-        with open(pca_path, "rb") as f:
-            pca_data = pickle.load(f)
-        # Load counts from memmap shapes
+        print(f"Found existing data in {out_folder}, skipping encoding.")
         n_in   = len(np.load(mm["X_train_in"],  mmap_mode="r"))
         n_out  = len(np.load(mm["X_train_out"], mmap_mode="r"))
         n_test = len(np.load(mm["X_test"],      mmap_mode="r"))
         idx_in, idx_out, idx_test = n_in, n_out, n_test
         print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
+
     else:
-        # ── 1. Count samples ──────────────────────────────────────────────────
+        # ── 1. Count samples ──────────────────────────────────────────────
         n_in = n_out = n_test = 0
         for i, fp in enumerate(files):
             d = np.where(np.load(fp, allow_pickle=True)["dones"] == 0, 1, -1)
@@ -117,40 +135,37 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
                 n_in  += int((d ==  1).sum())
                 n_out += int((d != 1).sum())
             else:
-                n_test += 150
+                n_test += len(d)
         print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
 
-        # ── 2. Fit scaler + PCA ───────────────────────────────────────────────
-        ipca   = IncrementalPCA(n_components=pca_dim, batch_size=1024)
-        scaler = StandardScaler()
+        # ── 2. Fit scaler + PCA (skipped if --no-pca) ─────────────────────
+        if args.no_pca:
+            scaler, ipca = None, None
+        else:
+            ipca   = IncrementalPCA(n_components=pca_dim, batch_size=1024)
+            scaler = StandardScaler()
+            print("Fitting scaler + PCA...")
+            for i, fp in enumerate(files[:num_train]):
+                if i % 100 == 0:
+                    print(f"  PCA fit {i}/{num_train}")
+                imgs_np = np.load(fp, allow_pickle=True)["images"]
+                enc_np  = encoder.encode(imgs_np, device)
+                scaler.partial_fit(enc_np)
+                ipca.partial_fit(scaler.transform(enc_np))
+            print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
 
-        print("Fitting scaler + PCA...")
-        for i, fp in enumerate(files[:num_train]):
-            if i % 100 == 0:
-                print(f"  PCA fit {i}/{num_train}")
-            imgs_np = np.load(fp, allow_pickle=True)["images"]
-            enc_np  = encoder.encode(imgs_np, device)
-            scaler.partial_fit(enc_np)
-            ipca.partial_fit(scaler.transform(enc_np))
-
-        print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
-
-        # Save PCA pipeline for use in test_sdf.py
-        pca_path = os.path.join(out_folder, "pca_pipeline.pkl")
+        # Save PCA pipeline (scaler/ipca are None when no_pca=True)
         with open(pca_path, "wb") as f:
-            pickle.dump({"scaler": scaler, "ipca": ipca}, f)
+            pickle.dump({"scaler": scaler, "ipca": ipca, "no_pca": args.no_pca}, f)
         print(f"PCA pipeline saved to {pca_path}")
 
-        # ── 3. Allocate memmaps ───────────────────────────────────────────────
-        mm = {k: os.path.join(out_folder, f"{k}.npy") for k in
-            ["X_train_in", "X_train_out", "X_test", "y_test"]}
-
+        # ── 3. Allocate memmaps ───────────────────────────────────────────
         mm_in   = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_in,   pca_dim))
         mm_out  = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_out,  pca_dim))
         mm_test = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test, pca_dim))
         mm_yt   = np.lib.format.open_memmap(mm["y_test"],      mode="w+", dtype="float32", shape=(n_test,))
 
-        # ── 4. Encode → PCA → write ───────────────────────────────────────────
+        # ── 4. Encode → (PCA) → write ─────────────────────────────────────
         print("Encoding + writing memmaps...")
         idx_in = idx_out = idx_test = 0
 
@@ -160,14 +175,14 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
             file    = np.load(fp, allow_pickle=True)
             imgs_np = file["images"]
             d       = np.where(file["dones"] == 0, 1, -1)
-            enc_np  = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
+            enc_np  = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
 
             if i < num_train:
                 mask_in  = (d == 1);  mask_out = ~mask_in
                 n_i = mask_in.sum();  n_o = mask_out.sum()
                 mm_in [idx_in :idx_in  + n_i] = enc_np[mask_in]
                 mm_out[idx_out:idx_out + n_o] = enc_np[mask_out]
-                idx_in += n_i;  idx_out += n_o
+                idx_in  += n_i;  idx_out += n_o
             else:
                 chunk = len(d)
                 mm_test[idx_test:idx_test + chunk] = enc_np
@@ -178,25 +193,24 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
         print(f"Done → in: {idx_in}, out: {idx_out}, test: {idx_test}")
 
     # ── 5. DataLoaders ────────────────────────────────────────────────────
-    n_safe   = idx_in   # frames where d == 1
-    n_unsafe = idx_out  # frames where d == -1
+    weights_in  = torch.full((int(idx_in),),  1.0 / idx_in)
+    weights_out = torch.full((int(idx_out),), 1.0 / idx_out)
+    sampler_in  = WeightedRandomSampler(weights_in,  num_samples=int(idx_in),  replacement=True)
+    sampler_out = WeightedRandomSampler(weights_out, num_samples=int(idx_out), replacement=True)
 
-    # Each safe frame gets weight 1/n_safe, each unsafe gets 1/n_unsafe
-    weights_in  = torch.full((n_safe,),   1.0 / n_safe)
-    weights_out = torch.full((n_unsafe,), 1.0 / n_unsafe)
-
-    sampler_in  = WeightedRandomSampler(weights_in,  num_samples=int(n_safe),   replacement=True)
-    sampler_out = WeightedRandomSampler(weights_out, num_samples=int(n_unsafe), replacement=True)
-    loader_in   = DataLoader(MemmapDataset(mm["X_train_in"],  device=device), batch_size=config.batch_size, sampler=sampler_in)
-    loader_out  = DataLoader(MemmapDataset(mm["X_train_out"], device=device), batch_size=config.batch_size, sampler=sampler_out)
-    test_loader = DataLoader(MemmapDataset(mm["X_test"], mm["y_test"], device=device), batch_size=config.test_batch_size)
+    loader_in   = DataLoader(MemmapDataset(mm["X_train_in"],  device=device),
+                             batch_size=config.batch_size, sampler=sampler_in)
+    loader_out  = DataLoader(MemmapDataset(mm["X_train_out"], device=device),
+                             batch_size=config.batch_size, sampler=sampler_out)
+    test_loader = DataLoader(MemmapDataset(mm["X_test"], mm["y_test"], device=device),
+                             batch_size=config.test_batch_size)
 
     # ── 6. SDF model ──────────────────────────────────────────────────────
     model = select_model(args.model, pca_dim, args.n_layers, args.n_hidden).to(device)
     print(f"SDF parameters: {count_parameters(model)}")
 
     # ── 8. Train ──────────────────────────────────────────────────────────
-    config.output_folder = out_folder  # point callbacks to per-run folder
+    config.output_folder = out_folder
     callbacks = [LoggerCB(os.path.join(out_folder, "log.csv"))]
     if config.checkpoint_freq > 0:
         callbacks.append(CheckpointCB(
@@ -223,12 +237,12 @@ if __name__ == "__main__":
     args   = get_args()
     device = get_device(args.cpu)
 
-    # Build encoder
     enc_kwargs = {}
     if args.encoder == "cjepa":
         enc_kwargs["checkpoint_path"] = args.cjepa_ckpt
     elif args.encoder == "dreamer":
         enc_kwargs["checkpoint_path"] = args.dreamer_ckpt
+        enc_kwargs["configs_path"]    = args.dreamer_configs
     elif args.encoder == "autoencoder":
         enc_kwargs["checkpoint_path"] = args.autoencoder_ckpt
     elif args.encoder == "lewm":
@@ -256,7 +270,10 @@ if __name__ == "__main__":
         output_folder   = None,
     )
 
-    for pca_dim in args.pca_dims:
-        run_pca_dim(args, encoder, files, num_train, device, pca_dim, config)
+    if args.no_pca:
+        run_pca_dim(args, encoder, files, num_train, device, None, config)
+    else:
+        for pca_dim in args.pca_dims:
+            run_pca_dim(args, encoder, files, num_train, device, pca_dim, config)
 
     print("\nAll runs complete.")
