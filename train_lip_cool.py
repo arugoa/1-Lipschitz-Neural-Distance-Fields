@@ -96,7 +96,7 @@ def transform_enc(enc_np, scaler, ipca, no_pca):
 
 # ── Main training function ─────────────────────────────────────────────────
 
-def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
+def run_pca_dim(args, encoder, files, device, pca_dim, config):
     """Run the full pipeline for one PCA dimension (or no PCA)."""
 
     if args.no_pca:
@@ -122,50 +122,58 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
         print(f"Found existing data in {out_folder}, skipping encoding.")
         n_in   = len(np.load(mm["X_train_in"],  mmap_mode="r"))
         n_out  = len(np.load(mm["X_train_out"], mmap_mode="r"))
-        n_test = len(np.load(mm["X_test"],      mmap_mode="r"))
-        idx_in, idx_out, idx_test = n_in, n_out, n_test
-        print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
+        idx_in, idx_out = n_in, n_out
+        print(f"Train → safe: {n_in}, unsafe: {n_out}")
+        print(f"Test  → {len(np.load(mm['X_test'], mmap_mode='r'))} frames")
 
     else:
-        # ── 1. Count samples ──────────────────────────────────────────────
-        n_in = n_out = n_test = 0
-        for i, fp in enumerate(files):
-            d = np.where(np.load(fp, allow_pickle=True)["dones"] == 0, 1, -1)
-            if i < num_train:
-                n_in  += int((d ==  1).sum())
-                n_out += int((d != 1).sum())
-            else:
-                n_test += len(d)
-        print(f"Samples → in: {n_in}, out: {n_out}, test: {n_test}")
+        # ── 1. Count total safe/unsafe frames across all episodes ──────────
+        print("Counting frames...")
+        n_safe_total = n_unsafe_total = 0
+        for fp in files:
+            d = np.load(fp, allow_pickle=True)["dones"]
+            n_safe_total   += int((d == 0).sum())
+            n_unsafe_total += int((d != 0).sum())
+        print(f"Total frames → safe: {n_safe_total}, unsafe: {n_unsafe_total}")
 
-        # ── 2. Fit scaler + PCA (skipped if --no-pca) ─────────────────────
+        # 70% of each class goes to train, 30% to test
+        n_safe_train   = int(n_safe_total   * 0.7)
+        n_unsafe_train = int(n_unsafe_total * 0.7)
+        n_safe_test    = n_safe_total   - n_safe_train
+        n_unsafe_test  = n_unsafe_total - n_unsafe_train
+        n_test         = n_safe_test + n_unsafe_test
+        print(f"Train → safe: {n_safe_train}, unsafe: {n_unsafe_train}")
+        print(f"Test  → safe: {n_safe_test},  unsafe: {n_unsafe_test}")
+
+        # ── 2. Fit scaler + PCA on all episodes (skipped if --no-pca) ─────
         if args.no_pca:
             scaler, ipca = None, None
         else:
             ipca   = IncrementalPCA(n_components=pca_dim, batch_size=1024)
             scaler = StandardScaler()
             print("Fitting scaler + PCA...")
-            for i, fp in enumerate(files[:num_train]):
+            for i, fp in enumerate(files):
                 if i % 100 == 0:
-                    print(f"  PCA fit {i}/{num_train}")
+                    print(f"  PCA fit {i}/{len(files)}")
                 imgs_np = np.load(fp, allow_pickle=True)["images"]
                 enc_np  = encoder.encode(imgs_np, device)
                 scaler.partial_fit(enc_np)
                 ipca.partial_fit(scaler.transform(enc_np))
             print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
 
-        # Save PCA pipeline (scaler/ipca are None when no_pca=True)
         with open(pca_path, "wb") as f:
             pickle.dump({"scaler": scaler, "ipca": ipca, "no_pca": args.no_pca}, f)
         print(f"PCA pipeline saved to {pca_path}")
 
         # ── 3. Allocate memmaps ───────────────────────────────────────────
-        mm_in   = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_in,   pca_dim))
-        mm_out  = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_out,  pca_dim))
-        mm_test = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test, pca_dim))
+        mm_in   = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_safe_train,   pca_dim))
+        mm_out  = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_unsafe_train, pca_dim))
+        mm_test = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test,         pca_dim))
         mm_yt   = np.lib.format.open_memmap(mm["y_test"],      mode="w+", dtype="float32", shape=(n_test,))
 
-        # ── 4. Encode → (PCA) → write ─────────────────────────────────────
+        # ── 4. Encode → (PCA) → write, filling train first then test ──────
+        # We fill train slots until each class hits its 70% quota,
+        # then overflow goes to test.
         print("Encoding + writing memmaps...")
         idx_in = idx_out = idx_test = 0
 
@@ -174,29 +182,63 @@ def run_pca_dim(args, encoder, files, num_train, device, pca_dim, config):
                 print(f"  Episode {i}/{len(files)}")
             file    = np.load(fp, allow_pickle=True)
             imgs_np = file["images"]
-            d       = np.where(file["dones"] == 0, 1, -1)
+            d       = np.where(file["dones"] == 0, 1, -1)  # 1=safe, -1=unsafe
             enc_np  = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
 
-            if i < num_train:
-                mask_in  = (d == 1);  mask_out = ~mask_in
-                n_i = mask_in.sum();  n_o = mask_out.sum()
-                mm_in [idx_in :idx_in  + n_i] = enc_np[mask_in]
-                mm_out[idx_out:idx_out + n_o] = enc_np[mask_out]
-                idx_in  += n_i;  idx_out += n_o
-            else:
-                chunk = len(d)
-                mm_test[idx_test:idx_test + chunk] = enc_np
-                mm_yt  [idx_test:idx_test + chunk] = d.astype("float32")
-                idx_test += chunk
+            safe_mask   = (d ==  1)
+            unsafe_mask = (d == -1)
+
+            safe_enc   = enc_np[safe_mask]
+            unsafe_enc = enc_np[unsafe_mask]
+
+            # Safe frames: fill train first, overflow to test
+            for chunk, enc in [("safe", safe_enc), ("unsafe", unsafe_enc)]:
+                if chunk == "safe":
+                    n_train_quota = n_safe_train
+                    idx_train     = idx_in
+                    label_val     = 1.0
+                    mm_train      = mm_in
+                else:
+                    n_train_quota = n_unsafe_train
+                    idx_train     = idx_out
+                    label_val     = -1.0
+                    mm_train      = mm_out
+
+                if len(enc) == 0:
+                    continue
+
+                train_space = n_train_quota - idx_train
+                n_to_train  = min(len(enc), train_space)
+                n_to_test   = len(enc) - n_to_train
+
+                if n_to_train > 0:
+                    mm_train[idx_train:idx_train + n_to_train] = enc[:n_to_train]
+
+                if n_to_test > 0:
+                    mm_test[idx_test:idx_test + n_to_test] = enc[n_to_train:]
+                    mm_yt  [idx_test:idx_test + n_to_test] = label_val
+
+                if chunk == "safe":
+                    idx_in    += n_to_train
+                    idx_test  += n_to_test
+                else:
+                    idx_out   += n_to_train
+                    idx_test  += n_to_test
 
         del mm_in, mm_out, mm_test, mm_yt
-        print(f"Done → in: {idx_in}, out: {idx_out}, test: {idx_test}")
+        print(f"Done → train_in: {idx_in}, train_out: {idx_out}, test: {idx_test}")
 
     # ── 5. DataLoaders ────────────────────────────────────────────────────
-    weights_in  = torch.full((int(idx_in),),  1.0 / idx_in)
-    weights_out = torch.full((int(idx_out),), 1.0 / idx_out)
-    sampler_in  = WeightedRandomSampler(weights_in,  num_samples=int(idx_in),  replacement=True)
-    sampler_out = WeightedRandomSampler(weights_out, num_samples=int(idx_out), replacement=True)
+    n_safe     = int(idx_in)
+    n_unsafe   = int(idx_out)
+    n_balanced = min(n_safe, n_unsafe)
+    print(f"Balancing samplers: safe={n_safe}, unsafe={n_unsafe}, {n_balanced} each per epoch")
+
+    weights_in  = torch.full((n_safe,),   1.0 / n_safe)
+    weights_out = torch.full((n_unsafe,), 1.0 / n_unsafe)
+
+    sampler_in  = WeightedRandomSampler(weights_in,  num_samples=n_balanced, replacement=True)
+    sampler_out = WeightedRandomSampler(weights_out, num_samples=n_balanced, replacement=True)
 
     loader_in   = DataLoader(MemmapDataset(mm["X_train_in"],  device=device),
                              batch_size=config.batch_size, sampler=sampler_in)
@@ -251,11 +293,9 @@ if __name__ == "__main__":
     print(f"Loading encoder: {args.encoder} ...")
     encoder = build_encoder(args.encoder, **enc_kwargs)
 
-    files     = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
-    num_train = int(len(files) * 0.7)
-    print(f"Found {len(files)} episodes ({num_train} train).")
+    files = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
+    print(f"Found {len(files)} episodes.")
 
-    # Shared config (output_folder overridden per run)
     config = SimpleNamespace(
         signed          = not args.unsigned,
         device          = device,
@@ -271,9 +311,9 @@ if __name__ == "__main__":
     )
 
     if args.no_pca:
-        run_pca_dim(args, encoder, files, num_train, device, None, config)
+        run_pca_dim(args, encoder, files, device, None, config)
     else:
         for pca_dim in args.pca_dims:
-            run_pca_dim(args, encoder, files, num_train, device, pca_dim, config)
+            run_pca_dim(args, encoder, files, device, pca_dim, config)
 
     print("\nAll runs complete.")
