@@ -155,7 +155,7 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
             for i, fp in enumerate(files):
                 if i % 100 == 0:
                     print(f"  PCA fit {i}/{len(files)}")
-                imgs_np = np.load(fp, allow_pickle=True)["images"]
+                imgs_np = np.load(fp, allow_pickle=True)["image"]
                 enc_np  = encoder.encode(imgs_np, device)
                 scaler.partial_fit(enc_np)
                 ipca.partial_fit(scaler.transform(enc_np))
@@ -181,7 +181,7 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
             if i % 200 == 0:
                 print(f"  Episode {i}/{len(files)}")
             file    = np.load(fp, allow_pickle=True)
-            imgs_np = file["images"]
+            imgs_np = file["image"]
             d       = np.where(file["dones"] == 0, 1, -1)  # 1=safe, -1=unsafe
             enc_np  = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
 
