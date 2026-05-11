@@ -35,7 +35,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Unified SDF training")
 
     # dataset
-    parser.add_argument("dataset", type=str, help="Path to dataset folder")
+    parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
     parser.add_argument("-o", "--output-name", type=str, default="output")
     parser.add_argument("--unsigned", action="store_true")
 

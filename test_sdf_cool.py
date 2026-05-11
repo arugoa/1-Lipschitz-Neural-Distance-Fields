@@ -22,7 +22,7 @@ from common.utils import get_device
 def get_args():
     parser = argparse.ArgumentParser(description="Unified SDF evaluation")
 
-    parser.add_argument("dataset", type=str, help="Path to dataset folder")
+    parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
     parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm"],
                         default="cjepa")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
