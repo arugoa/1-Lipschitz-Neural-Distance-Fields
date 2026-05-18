@@ -5,6 +5,7 @@ ENCODER_REGISTRY = {
     'autoencoder': ('encoders.autoencoder', 'AutoencoderEncoder'),
     'dreamer':     ('encoders.dreamer',     'DreamerEncoder'),
     'lewm':        ('encoders.lewm',        'LEWMEncoder'),
+    'ts':        ('encoders.straightening',        'TSEncoder'),
 }
 
 def build_encoder(name: str, **kwargs) -> BaseEncoder:

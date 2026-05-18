@@ -23,12 +23,14 @@ def get_args():
     parser = argparse.ArgumentParser(description="Unified SDF evaluation")
 
     parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
-    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm"],
+    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts"],
                         default="cjepa")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
     parser.add_argument("--dreamer-ckpt", type=str, default=None)
     parser.add_argument("--autoencoder-ckpt", type=str, default=None)
     parser.add_argument("--lewm-ckpt", type=str, default=None)
+    parser.add_argument("--ts-ckpt", type=str, default=None)
+    parser.add_argument("--ts-img-size", type=int, default=224)
 
     # Point at the run directory produced by train_lip.py
     parser.add_argument("--run-dir", type=str, required=True,
@@ -79,6 +81,9 @@ if __name__ == "__main__":
         enc_kwargs["checkpoint_path"] = args.autoencoder_ckpt
     elif args.encoder == "lewm":
         enc_kwargs["checkpoint_path"] = args.lewm_ckpt
+    elif args.encoder == "ts":
+        enc_kwargs["checkpoint_path"] = args.ts_ckpt
+        enc_kwargs["img_size"]        = args.ts_img_size
 
     print(f"Loading encoder: {args.encoder} ...")
     encoder = build_encoder(args.encoder, **enc_kwargs)

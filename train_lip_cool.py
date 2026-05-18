@@ -40,13 +40,15 @@ def get_args():
     parser.add_argument("--unsigned", action="store_true")
 
     # encoder selection
-    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm"],
+    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts"],
                         default="cjepa", help="Which encoder to use")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
     parser.add_argument("--dreamer-ckpt", type=str, default=None)
     parser.add_argument("--dreamer-configs", type=str, default="../configs.yaml")
     parser.add_argument("--autoencoder-ckpt", type=str, default=None)
     parser.add_argument("--lewm-ckpt", type=str, default=None)
+    parser.add_argument("--ts-ckpt", type=str, default=None)
+    parser.add_argument("--ts-img-size", type=int, default=224)
 
     # PCA
     parser.add_argument("-p", "--pca-dims", type=int, nargs="+", default=[3],
@@ -155,7 +157,7 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
             for i, fp in enumerate(files):
                 if i % 100 == 0:
                     print(f"  PCA fit {i}/{len(files)}")
-                imgs_np = np.load(fp, allow_pickle=True)["image"]
+                imgs_np = np.load(fp, allow_pickle=True)["images"]
                 enc_np  = encoder.encode(imgs_np, device)
                 scaler.partial_fit(enc_np)
                 ipca.partial_fit(scaler.transform(enc_np))
@@ -181,7 +183,7 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
             if i % 200 == 0:
                 print(f"  Episode {i}/{len(files)}")
             file    = np.load(fp, allow_pickle=True)
-            imgs_np = file["image"]
+            imgs_np = file["images"]
             d       = np.where(file["dones"] == 0, 1, -1)  # 1=safe, -1=unsafe
             enc_np  = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
 
@@ -289,6 +291,9 @@ if __name__ == "__main__":
         enc_kwargs["checkpoint_path"] = args.autoencoder_ckpt
     elif args.encoder == "lewm":
         enc_kwargs["checkpoint_path"] = args.lewm_ckpt
+    elif args.encoder == "ts":
+        enc_kwargs["checkpoint_path"] = args.ts_ckpt
+        enc_kwargs["img_size"]        = args.ts_img_size
 
     print(f"Loading encoder: {args.encoder} ...")
     encoder = build_encoder(args.encoder, **enc_kwargs)
