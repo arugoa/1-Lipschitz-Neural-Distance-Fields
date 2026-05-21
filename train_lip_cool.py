@@ -14,6 +14,8 @@ import glob
 import argparse
 import pickle
 from types import SimpleNamespace
+import hydra
+from hydra import compose, initialize
 
 import numpy as np
 import torch
@@ -36,6 +38,7 @@ def get_args():
 
     # dataset
     parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
+    parser.add_argument("--dataset-mode", choices=["npz", "ts"], default="npz",)
     parser.add_argument("-o", "--output-name", type=str, default="output")
     parser.add_argument("--unsigned", action="store_true")
 
@@ -48,7 +51,13 @@ def get_args():
     parser.add_argument("--autoencoder-ckpt", type=str, default=None)
     parser.add_argument("--lewm-ckpt", type=str, default=None)
     parser.add_argument("--ts-ckpt", type=str, default=None)
+
     parser.add_argument("--ts-img-size", type=int, default=224)
+    parser.add_argument("--ts-config", type=str, default=None,)
+    parser.add_argument("--num-hist", type=int, default=1)
+    parser.add_argument("--num-pred", type=int, default=1)
+    parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument("--split", choices=["train", "valid"], default="train",)
 
     # PCA
     parser.add_argument("-p", "--pca-dims", type=int, nargs="+", default=[3],
@@ -89,6 +98,46 @@ class MemmapDataset(torch.utils.data.Dataset):
                      for a in self.arrays)
 
 
+class TemporalStraighteningFrameDataset(torch.utils.data.Dataset):
+    def __init__(self, ts_dataset):
+        self.ts_dataset = ts_dataset
+
+    def __len__(self):
+        return len(self.ts_dataset)
+
+    def __getitem__(self, idx):
+        obs, act, state = self.ts_dataset[idx]
+
+        imgs = obs["visual"]
+
+        if torch.is_tensor(imgs):
+            imgs = imgs.cpu().numpy()
+
+        dones = np.zeros(len(imgs), dtype=np.int32)
+
+        return {
+            "image": imgs,
+            "dones": dones,
+        }
+
+
+def load_ts_dataset(args):
+    with initialize(version_base=None, config_path="../conf"):
+        cfg = compose(config_name="train")
+
+    datasets, traj_dsets = hydra.utils.call(
+        cfg.env.dataset,
+        num_hist=args.num_hist,
+        num_pred=args.num_pred,
+        frameskip=args.frameskip,
+    )
+    dataset = datasets[args.split]
+
+    print(f"Loaded TS dataset split={args.split}")
+    print(f"Dataset size: {len(dataset)}")
+    return TemporalStraighteningFrameDataset(dataset)
+
+
 def transform_enc(enc_np, scaler, ipca, no_pca):
     """Apply scaler + PCA, or return raw if no_pca."""
     if no_pca:
@@ -97,8 +146,22 @@ def transform_enc(enc_np, scaler, ipca, no_pca):
 
 
 # ── Main training function ─────────────────────────────────────────────────
+def get_sample(args, dataset_source, idx):
+    if args.dataset_mode == "npz":
+        fp = dataset_source[idx]
+        file = np.load(fp, allow_pickle=True)
+        imgs_np = file["image"]
+        d = np.where(file["dones"] == 0, 1, -1)
+    else:
+        sample = dataset_source[idx]
+        imgs_np = sample["image"]
+        if torch.is_tensor(imgs_np):
+            imgs_np = imgs_np.cpu().numpy()
+        d = np.where(sample["dones"] == 0, 1, -1)
+    return imgs_np, d
 
-def run_pca_dim(args, encoder, files, device, pca_dim, config):
+
+def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
     """Run the full pipeline for one PCA dimension (or no PCA)."""
 
     if args.no_pca:
@@ -132,10 +195,10 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
         # ── 1. Count total safe/unsafe frames across all episodes ──────────
         print("Counting frames...")
         n_safe_total = n_unsafe_total = 0
-        for fp in files:
-            d = np.load(fp, allow_pickle=True)["dones"]
-            n_safe_total   += int((d == 0).sum())
-            n_unsafe_total += int((d != 0).sum())
+        for i in range(len(dataset_source)):
+            _, d = get_sample(args, dataset_source, i)
+            n_safe_total += int((d == 1).sum())
+            n_unsafe_total += int((d == -1).sum())
         print(f"Total frames → safe: {n_safe_total}, unsafe: {n_unsafe_total}")
 
         # 70% of each class goes to train, 30% to test
@@ -154,11 +217,11 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
             ipca   = IncrementalPCA(n_components=pca_dim, batch_size=1024)
             scaler = StandardScaler()
             print("Fitting scaler + PCA...")
-            for i, fp in enumerate(files):
+            for i in range(len(dataset_source)):
                 if i % 100 == 0:
-                    print(f"  PCA fit {i}/{len(files)}")
-                imgs_np = np.load(fp, allow_pickle=True)["images"]
-                enc_np  = encoder.encode(imgs_np, device)
+                    print(f"  PCA fit {i}/{len(dataset_source)}")
+                imgs_np, _ = get_sample(args, dataset_source, i)
+                enc_np = encoder.encode(imgs_np, device)
                 scaler.partial_fit(enc_np)
                 ipca.partial_fit(scaler.transform(enc_np))
             print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
@@ -179,13 +242,11 @@ def run_pca_dim(args, encoder, files, device, pca_dim, config):
         print("Encoding + writing memmaps...")
         idx_in = idx_out = idx_test = 0
 
-        for i, fp in enumerate(files):
+        for i in range(len(dataset_source)):
             if i % 200 == 0:
-                print(f"  Episode {i}/{len(files)}")
-            file    = np.load(fp, allow_pickle=True)
-            imgs_np = file["images"]
-            d       = np.where(file["dones"] == 0, 1, -1)  # 1=safe, -1=unsafe
-            enc_np  = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
+                print(f"  Episode {i}/{len(dataset_source)}")
+            imgs_np, d = get_sample(args, dataset_source, i)
+            enc_np = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
 
             safe_mask   = (d ==  1)
             unsafe_mask = (d == -1)
@@ -298,8 +359,11 @@ if __name__ == "__main__":
     print(f"Loading encoder: {args.encoder} ...")
     encoder = build_encoder(args.encoder, **enc_kwargs)
 
-    files = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
-    print(f"Found {len(files)} episodes.")
+    if args.dataset_mode == "npz":
+        dataset_source = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
+        print(f"Found {len(dataset_source)} episodes.")
+    else:
+        dataset_source = load_ts_dataset(args)
 
     config = SimpleNamespace(
         signed          = not args.unsigned,
@@ -316,9 +380,9 @@ if __name__ == "__main__":
     )
 
     if args.no_pca:
-        run_pca_dim(args, encoder, files, device, None, config)
+        run_pca_dim(args, encoder, dataset_source, device, None, config)
     else:
         for pca_dim in args.pca_dims:
-            run_pca_dim(args, encoder, files, device, pca_dim, config)
+            run_pca_dim(args, encoder, dataset_source, device, pca_dim, config)
 
     print("\nAll runs complete.")

@@ -54,15 +54,27 @@ class TSEncoder(BaseEncoder):
 
     def encode(self, imgs_np: np.ndarray, device: str) -> np.ndarray:
         """
-        imgs_np: (T, H, W, C) uint8
+        imgs_np: (T, H, W, C) uint8  OR  (T, C, H, W) float tensor/array
         returns: (T, emb_dim) float32 numpy
         """
-        frames = [self.transform(imgs_np[t]) for t in range(len(imgs_np))]
-        imgs_t = torch.stack(frames).to(device)   # (T, C, H, W)
+        # TS dataset returns (T, C, H, W) float tensors — detect and handle both
+        if torch.is_tensor(imgs_np):
+            imgs_t = imgs_np.float().to(device)   # already (T, C, H, W)
+            if imgs_t.max() > 1.0:
+                imgs_t = imgs_t / 255.0
+        elif imgs_np.ndim == 4 and imgs_np.shape[1] in (1, 3):
+            # (T, C, H, W) numpy — already channels-first
+            imgs_t = torch.from_numpy(imgs_np).float().to(device)
+            if imgs_t.max() > 1.0:
+                imgs_t = imgs_t / 255.0
+        else:
+            # (T, H, W, C) uint8 numpy — apply full transform
+            frames = [self.transform(imgs_np[t]) for t in range(len(imgs_np))]
+            imgs_t = torch.stack(frames).to(device)
 
         with torch.no_grad():
-            out = self.encoder(imgs_t)             # (T, num_patches, D) or (T, 1, D)
-            enc = out.mean(dim=1)                  # (T, D) — mean-pool patches
+            out = self.encoder(imgs_t)
+            enc = out.mean(dim=1)
 
         result = enc.cpu().float().numpy()
         del imgs_t, out, enc

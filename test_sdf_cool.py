@@ -10,6 +10,9 @@ import sys
 import glob
 import argparse
 import pickle
+import hydra
+from hydra import initialize, compose
+from omegaconf import OmegaConf
 
 import numpy as np
 import torch
@@ -23,6 +26,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Unified SDF evaluation")
 
     parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
+    parser.add_argument("--dataset-mode", choices=["npz", "ts"], default="npz")
     parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts"],
                         default="cjepa")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
@@ -31,6 +35,11 @@ def get_args():
     parser.add_argument("--lewm-ckpt", type=str, default=None)
     parser.add_argument("--ts-ckpt", type=str, default=None)
     parser.add_argument("--ts-img-size", type=int, default=224)
+    parser.add_argument("--ts-config", type=str, default=None)
+    parser.add_argument("--num-hist", type=int, default=1)
+    parser.add_argument("--num-pred", type=int, default=1)
+    parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument("--split", choices=["train", "valid"], default="valid")
 
     # Point at the run directory produced by train_lip.py
     parser.add_argument("--run-dir", type=str, required=True,
@@ -42,6 +51,46 @@ def get_args():
     parser.add_argument("-cpu", action="store_true")
 
     return parser.parse_args()
+
+
+class TemporalStraighteningFrameDataset(torch.utils.data.Dataset):
+    def __init__(self, ts_dataset):
+        self.ts_dataset = ts_dataset
+
+    def __len__(self):
+        return len(self.ts_dataset)
+
+    def __getitem__(self, idx):
+        obs, act, state = self.ts_dataset[idx]
+
+        imgs = obs["visual"]
+
+        if torch.is_tensor(imgs):
+            imgs = imgs.cpu().numpy()
+
+        dones = np.zeros(len(imgs), dtype=np.int32)
+
+        return {
+            "image": imgs,
+            "dones": dones,
+        }
+
+
+def load_ts_dataset(args):
+    with initialize(version_base=None, config_path="../conf"):
+        cfg = compose(config_name="train")
+
+    datasets, traj_dsets = hydra.utils.call(
+        cfg.env.dataset,
+        num_hist=args.num_hist,
+        num_pred=args.num_pred,
+        frameskip=args.frameskip,
+    )
+    dataset = datasets[args.split]
+
+    print(f"Loaded TS dataset split={args.split}")
+    print(f"Dataset size: {len(dataset)}")
+    return TemporalStraighteningFrameDataset(dataset)
 
 
 def evaluate(preds, y_test):
@@ -102,33 +151,47 @@ if __name__ == "__main__":
     sdf.eval()
 
     # ── Encode test episodes on-the-fly ───────────────────────────────────
-    files     = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
-    num_train = int(len(files) * 0.7)
-    test_files = files[num_train:]
-    print(f"Evaluating on {len(test_files)} test episodes...")
-
+    if args.dataset_mode == "npz":
+        files         = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
+        num_train     = int(len(files) * 0.7)
+        dataset_source = files[num_train:]
+        print(f"Evaluating on {len(dataset_source)} npz test episodes...")
+    else:
+        dataset_source = load_ts_dataset(args)
+        print(f"Evaluating on {len(dataset_source)} TS episodes...")
+ 
+    # ── Single evaluation loop ────────────────────────────────────────────
     preds_all  = []
     labels_all = []
-
-    for i, fp in enumerate(test_files):
+ 
+    for i in range(len(dataset_source)):
         if i % 100 == 0:
-            print(f"  Episode {i}/{len(test_files)}")
-        file    = np.load(fp, allow_pickle=True)
-        imgs_np = file["images"]
-        d       = np.where(file["dones"] == 0, 1, -1)
-
-        if ipca is not None:
-            enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
-            enc_t  = torch.from_numpy(enc_np).float().to(device)
+            print(f"  Episode {i}/{len(dataset_source)}")
+ 
+        if args.dataset_mode == "npz":
+            file    = np.load(dataset_source[i], allow_pickle=True)
+            imgs_np = file["image"]
+            d       = np.where(file["dones"] == 0, 1, -1)
         else:
-            enc_t = torch.from_numpy(encoder.encode(imgs_np, device)).float().to(device)
-
+            sample  = dataset_source[i]
+            imgs_np = sample["image"]
+            if torch.is_tensor(imgs_np):
+                imgs_np = imgs_np.cpu().numpy()
+            d = np.where(sample["dones"] == 0, 1, -1)
+ 
+        if ipca is None:
+            enc_np = encoder.encode(imgs_np, device)
+        else:
+            enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
+ 
+        enc_t = torch.from_numpy(enc_np.astype("float32")).to(device)
+ 
         with torch.no_grad():
             preds = sdf(enc_t).squeeze(-1).cpu()
-
+ 
         preds_all.append(preds)
         labels_all.append(torch.from_numpy(d.astype("float32")))
-
+ 
     preds  = torch.cat(preds_all)
     labels = torch.cat(labels_all)
 
