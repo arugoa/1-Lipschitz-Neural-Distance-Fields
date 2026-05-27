@@ -38,13 +38,29 @@ def get_args():
 
     # dataset
     parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
-    parser.add_argument("--dataset-mode", choices=["npz", "ts"], default="npz",)
+    parser.add_argument("--dataset-mode", choices=["npz", "ts", "wall"], default="npz",)
     parser.add_argument("-o", "--output-name", type=str, default="output")
     parser.add_argument("--unsigned", action="store_true")
+    parser.add_argument("--wall-obses-dir",  type=str, default=None,
+                    help="Folder of per-episode image .pth files")
+    parser.add_argument("--wall-states",     type=str, default=None)
+    parser.add_argument("--wall-locs",       type=str, default=None)
+    parser.add_argument("--door-locs",       type=str, default=None)
+    # parser.add_argument("--ball-radius",     type=float, default=1.0)
+    # parser.add_argument("--door-half-w",     type=float, default=4.0)
+    # parser.add_argument("--wall-width",      type=float, default=4.0,
+    #                     help="Thickness of the middle wall in world units")
+    # parser.add_argument("--border-wall-loc", type=float, default=2.0,
+    #                     help="Thickness of the border walls in world units")
+    # parser.add_argument("--env-size",        type=float, default=64.0)
+    parser.add_argument("--wall-config", type=str, default=None,
+                        help="Path to wall_config.pkl — loads all geometry automatically")
 
     # encoder selection
-    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts"],
+    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts", "gt_state"],
                         default="cjepa", help="Which encoder to use")
+    parser.add_argument("--state-key", type=str, default="state",
+                    help="Key for ground-truth state in npz files (gt-state encoder only)")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
     parser.add_argument("--dreamer-ckpt", type=str, default=None)
     parser.add_argument("--dreamer-configs", type=str, default="../configs.yaml")
@@ -121,6 +137,315 @@ class TemporalStraighteningFrameDataset(torch.utils.data.Dataset):
         }
 
 
+import pickle
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+def load_wall_config(config_path):
+    # don't unpickle manually — instantiate via hydra the same way train.py does
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    import hydra
+
+    # find the conf dir relative to the project root
+    conf_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../conf"))
+    
+    with initialize_config_dir(config_dir=conf_dir, version_base=None):
+        cfg = compose(config_name="train")
+
+    print(f"  loaded hydra config: env={cfg.env.name}")
+    return cfg
+
+
+def check_vertical_wall_intersect(pos1, pos2, wall_x, hole_y, door_space):
+    check_intersection = (
+        torch.sign(pos1[0] - wall_x) * torch.sign(pos2[0] - wall_x)
+    ) <= 0.1
+    if check_intersection:
+        # print("found intersection at", i, j.item())
+        d = pos2 - pos1
+        # a and b are the line parameters fit to the last step
+        a = d[1] / d[0]
+        b = pos1[1] - a * pos1[0]
+        # y is the intersection point of the wall plane
+        y = a * wall_x + b
+        # If the intersection point is in the hole, we are good
+        # otherwise, we need to move the point back
+        if (
+            hole_y is None or y < hole_y - door_space or y > hole_y + door_space
+        ):  # we're not in the hole
+            return torch.tensor([wall_x, y]).to(pos1.device)  # we intersect
+        else:
+            return None  # we are in the hole and we overlap
+    return None
+
+
+def check_horizontal_wall_intersect(pos1, pos2, wall_y, hole_x, door_space):
+    check_intersection = (
+        torch.sign(pos1[1] - wall_y) * torch.sign(pos2[1] - wall_y)
+    ) <= 0.1
+    if check_intersection:
+        d = pos2 - pos1
+        a = d[1] / d[0]
+        b = pos1[1] - a * pos1[0]
+        x = (wall_y - b) / a
+        if (
+            hole_x is None or x < hole_x - door_space or x > hole_x + door_space
+        ):  # we're not in the hole
+            return torch.tensor([x, wall_y]).to(pos1.device)  # we intersect
+        else:
+            return None  # we are in the hole and we overlap
+    return None
+
+
+def check_wall_intersect(
+    pos1,
+    pos2,
+    wall_x,
+    hole_y,
+    wall_width,
+    door_space,
+    border_wall_loc,
+    img_size,
+    add_noise=True,
+):
+    """
+    Parameters:
+        pos1: [2]
+        pos2: [2]
+        wall_x: []
+        hole_y: []
+        wall_width: int
+        door_space: int
+        border_wall_loc: int
+        img_size: int
+    Returns:
+        intersect: [2]
+        intersect_w_noise: [2]
+    """
+
+    # first, we check to see if the point bumps into the middle wall's width
+    left_wall_corner, right_wall_corner = (
+        wall_x - wall_width // 2,
+        wall_x + wall_width // 2,
+    )
+    door_bot, door_top = hole_y - door_space, hole_y + door_space
+
+    # check if it's moving upwards and crosses the door top horizontal line
+    if pos2[1] - pos1[1] > 0 and pos2[1] > door_top and pos1[1] < door_top:
+        # get x intercept with door top horizontal line
+        intersect = check_horizontal_wall_intersect(
+            pos1, pos2, door_top, None, door_space
+        )
+        # if x intercept occurs between the left and right wall
+        if (
+            intersect is not None
+            and left_wall_corner <= intersect[0]
+            and intersect[0] <= right_wall_corner
+        ):
+            # add downward noise and return early
+            # noise = torch.randn(2, device=pos1.device) * 0.5
+            noise = torch.ones(2, device=pos1.device) * 0.5
+            noise[1] = noise[1].abs() * -1
+            return intersect, intersect + noise
+
+    # check if it's moving downwards and croseses the door bot horizontal line
+    if pos2[1] - pos1[1] < 0 and pos2[1] < door_bot and pos1[1] > door_bot:
+        # get x intercept with door bot horizontal line
+        intersect = check_horizontal_wall_intersect(
+            pos1, pos2, door_bot, None, door_space
+        )
+        # if x intercept occurs between the left and right wall
+        if (
+            intersect is not None
+            and left_wall_corner <= intersect[0]
+            and intersect[0] <= right_wall_corner
+        ):
+            # add upward noise and return early
+            # noise = torch.randn(2, device=pos1.device) * 0.5
+            noise = torch.ones(2, device=pos1.device) * 0.5
+            noise[1] = noise[1].abs()
+            return intersect, intersect + noise
+
+    # next, we check to see if point bumps into border and wall proper
+    left_wall, left_hole = border_wall_loc - 1, None
+    right_wall, right_hole = img_size - border_wall_loc, None
+    if wall_x > pos1[0]:
+        right_wall, right_hole = wall_x - wall_width // 2, hole_y
+    else:
+        left_wall, left_hole = wall_x + wall_width // 2, hole_y
+
+    top_wall, top_hole = border_wall_loc - 1, None
+    bot_wall, bot_hole = img_size - border_wall_loc, None
+
+    vertical_intersect = check_vertical_wall_intersect(
+        pos1, pos2, left_wall, left_hole, door_space
+    )
+    if vertical_intersect is None:
+        vertical_intersect = check_vertical_wall_intersect(
+            pos1, pos2, right_wall, right_hole, door_space
+        )
+
+    horizontal_intersect = check_horizontal_wall_intersect(
+        pos1, pos2, top_wall, top_hole, door_space
+    )
+    if horizontal_intersect is None:
+        horizontal_intersect = check_horizontal_wall_intersect(
+            pos1, pos2, bot_wall, bot_hole, door_space
+        )
+
+    if vertical_intersect is not None:
+        sign = torch.sign(pos1[0] - vertical_intersect[0])
+        # vertical_noise = torch.randn(2, device=pos1.device) * 0.5
+        vertical_noise = torch.ones(2, device=pos1.device) * 0.5
+        vertical_noise[0] = vertical_noise[0].abs() * sign
+
+    if horizontal_intersect is not None:
+        sign = torch.sign(pos1[1] - horizontal_intersect[1])
+        # horizontal_noise = torch.randn(2, device=pos1.device) * 0.5
+        horizontal_noise = torch.ones(2, device=pos1.device) * 0.5
+        horizontal_noise[1] = horizontal_noise[1].abs() * sign
+
+    if vertical_intersect is not None and horizontal_intersect is not None:
+        # return the intersection that happens first
+        if torch.norm(pos1 - vertical_intersect) < torch.norm(
+            pos1 - horizontal_intersect
+        ):
+            intersect = vertical_intersect
+            noise = vertical_noise
+        else:
+            intersect = horizontal_intersect
+            noise = horizontal_noise
+    elif vertical_intersect is not None:
+        intersect = vertical_intersect
+        noise = vertical_noise
+    elif horizontal_intersect is not None:
+        intersect = horizontal_intersect
+        noise = horizontal_noise
+    else:
+        return None, None
+
+    intersect_w_noise = intersect + noise
+    # we make sure after adding noise, we don't cross another wall
+    intersect_w_noise[0] = torch.clamp(
+        intersect_w_noise[0], min=left_wall, max=right_wall
+    )
+    intersect_w_noise[1] = torch.clamp(intersect_w_noise[1], min=top_wall, max=bot_wall)
+
+    if intersect_w_noise[0] <= left_wall:
+        intersect_w_noise[0] = left_wall + 0.3
+    if intersect_w_noise[0] >= right_wall:
+        intersect_w_noise[0] = right_wall - 0.3
+    if intersect_w_noise[1] <= top_wall:
+        intersect_w_noise[1] = top_wall + 0.3
+    if intersect_w_noise[1] >= bot_wall:
+        intersect_w_noise[1] = bot_wall - 0.3
+
+    return intersect, intersect_w_noise
+
+
+def is_near_wall(pos, wall_x, hole_y, wall_width, door_space, border_wall_loc, env_size, margin=1.5):
+    """
+    Returns True if pos is within margin units of any solid wall surface.
+    Handles middle wall (excluding door gap) and all 4 border walls.
+    """
+    x, y = float(pos[0]), float(pos[1])
+
+    # border walls
+    if x < border_wall_loc + margin:           return True
+    if x > env_size - border_wall_loc - margin: return True
+    if y < border_wall_loc + margin:           return True
+    if y > env_size - border_wall_loc - margin: return True
+
+    # middle vertical wall — only solid outside the door gap
+    left_edge  = wall_x - wall_width / 2
+    right_edge = wall_x + wall_width / 2
+    near_wall_x = (left_edge - margin) < x < (right_edge + margin)
+    in_door_gap = (hole_y - door_space) < y < (hole_y + door_space)
+
+    if near_wall_x and not in_door_gap:        return True
+
+    return False
+
+
+def compute_dones_from_geometry(states, wall_x_arr, door_y_arr,
+                                wall_width, door_space,
+                                border_wall_loc, env_size, margin=1.5):
+    T = len(states)
+    done = np.zeros(T, dtype=np.int32)
+
+    for t in range(T):
+        pos = torch.tensor(states[t], dtype=torch.float32)
+
+        # proximity check — catches stuck/repeated states
+        if is_near_wall(pos, wall_x_arr[t], door_y_arr[t],
+                        wall_width, door_space, border_wall_loc, env_size, margin):
+            done[t] = 1
+            continue
+
+        # crossing check — catches the step where collision first occurs
+        if t < T - 1:
+            pos2 = torch.tensor(states[t+1], dtype=torch.float32)
+            intersect, _ = check_wall_intersect(
+                pos, pos2,
+                wall_x          = float(wall_x_arr[t]),
+                hole_y          = float(door_y_arr[t]),
+                wall_width      = int(wall_width),
+                door_space      = door_space,
+                border_wall_loc = int(border_wall_loc),
+                img_size        = int(env_size),
+            )
+            if intersect is not None:
+                done[t] = 1
+
+    return done
+
+
+class WallDatasetSource:
+    """Mimics a list of npz paths so get_sample/dataset_source[i] still works."""
+    def __init__(self, obses_dir, states_path, wall_path, door_path,
+                 ball_radius, door_half_w, env_size,  wall_width, border_wall_loc):
+        import re
+        self.wall_width      = wall_width
+        self.border_wall_loc = border_wall_loc
+        self.obses_dir   = obses_dir
+        self.ball_radius = ball_radius
+        self.door_half_w = door_half_w
+        self.env_size    = env_size
+
+        self.states    = torch.load(states_path,  map_location="cpu", weights_only=False).numpy()
+        self.wall_locs = torch.load(wall_path,    map_location="cpu", weights_only=False).numpy()
+        self.door_locs = torch.load(door_path,    map_location="cpu", weights_only=False).numpy()
+
+        # sort episode files so index matches states row
+        self.eps = sorted(glob.glob(os.path.join(obses_dir, "*.pth")),
+                          key=lambda p: int(re.search(r'(\d+)', os.path.basename(p)).group(1)))
+        assert len(self.eps) == len(self.states), \
+            f"Episode file count ({len(self.eps)}) != states rows ({len(self.states)})"
+
+    def __len__(self):
+        return len(self.eps)
+
+    def __getitem__(self, idx):
+        imgs = torch.load(self.eps[idx], map_location="cpu",
+                          weights_only=False).numpy()   # (T, C, H, W) or (T, H, W, C)
+        # bx      = self.states[idx, :, 0]
+        # by      = self.states[idx, :, 1]
+        # wall_x  = self.wall_locs[idx, :, 0]
+        # door_y  = self.door_locs[idx, :, 0]
+        dones = compute_dones_from_geometry(
+            states          = self.states[idx],        # (T, 2)
+            wall_x_arr      = self.wall_locs[idx, :, 0],
+            door_y_arr      = self.door_locs[idx, :, 0],
+            wall_width      = self.wall_width,
+            door_space      = self.door_half_w,
+            border_wall_loc = self.border_wall_loc,
+            env_size        = self.env_size,
+        ).astype(np.int32)
+
+        # trim to same length in case images has an extra frame
+        T = min(len(imgs), len(dones))
+        return {"image": imgs[:T], "dones": dones[:T]}
+
+
 def load_ts_dataset(args):
     with initialize(version_base=None, config_path="../conf"):
         cfg = compose(config_name="train")
@@ -144,29 +469,58 @@ def transform_enc(enc_np, scaler, ipca, no_pca):
         return enc_np.astype("float32")
     return ipca.transform(scaler.transform(enc_np)).astype("float32")
 
-
 # ── Main training function ─────────────────────────────────────────────────
 def get_sample(args, dataset_source, idx):
     if args.dataset_mode == "npz":
         fp = dataset_source[idx]
         file = np.load(fp, allow_pickle=True)
-        imgs_np = file["image"]
-        d = np.where(file["dones"] == 0, 1, -1)
+        imgs_np    = file["image"]
+        d          = np.where(file["dones"] == 0, 1, -1)
+        states_np  = file[args.state_key] if args.state_key in file else None
+    elif args.dataset_mode == "wall":
+        sample     = dataset_source[idx]
+        imgs_np    = sample["image"]
+        d          = np.where(sample["dones"] == 0, 1, -1)
+        states_np  = dataset_source.states[idx]
     else:
-        sample = dataset_source[idx]
-        imgs_np = sample["image"]
+        sample     = dataset_source[idx]
+        imgs_np    = sample["image"]
         if torch.is_tensor(imgs_np):
             imgs_np = imgs_np.cpu().numpy()
-        d = np.where(sample["dones"] == 0, 1, -1)
-    return imgs_np, d
+        d          = np.where(sample["dones"] == 0, 1, -1)
+        states_np  = None
+    return imgs_np, d, states_np
 
 
 def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
     """Run the full pipeline for one PCA dimension (or no PCA)."""
 
+    # ── gt-state: bypass image encoding entirely ──────────────────────────
+    if args.encoder == "gt_state":
+        # peek at first episode to get state dimensionality
+        _, _, s0 = get_sample(args, dataset_source, 0)
+        assert s0 is not None, \
+            "gt-state encoder requires states in the dataset. " \
+            "Check --state-key for npz, or use --dataset-mode wall."
+        state_dim = s0.shape[-1] if s0.ndim > 1 else 1
+        args.no_pca = True   # states are already low-dim, skip PCA
+        pca_dim     = state_dim
+
+        def encode(imgs_np, device, states_np):
+            # flatten (T, N, D) → (T, N*D) if needed, else just (T, D)
+            s = np.array(states_np, dtype=np.float32)
+            return s.reshape(len(s), -1)
+
+    else:
+        def encode(imgs_np, device, states_np):
+            return encoder.encode(imgs_np, device)
+
     if args.no_pca:
-        pca_dim  = encoder.output_dim()
-        run_name = f"{args.encoder}_nopca_{args.model}"
+        if encoder is None:
+            pca_dim = 2
+        else:
+            pca_dim  = encoder.output_dim()
+        run_name = f"{args.encoder}_nopca_{args.model}_{args.dataset_mode}"
     else:
         run_name = f"{args.encoder}_pca{pca_dim}_{args.model}"
 
@@ -196,7 +550,7 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
         print("Counting frames...")
         n_safe_total = n_unsafe_total = 0
         for i in range(len(dataset_source)):
-            _, d = get_sample(args, dataset_source, i)
+            _, d, _ = get_sample(args, dataset_source, i)
             n_safe_total += int((d == 1).sum())
             n_unsafe_total += int((d == -1).sum())
         print(f"Total frames → safe: {n_safe_total}, unsafe: {n_unsafe_total}")
@@ -220,8 +574,8 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
             for i in range(len(dataset_source)):
                 if i % 100 == 0:
                     print(f"  PCA fit {i}/{len(dataset_source)}")
-                imgs_np, _ = get_sample(args, dataset_source, i)
-                enc_np = encoder.encode(imgs_np, device)
+                imgs_np, _, _ = get_sample(args, dataset_source, i)
+                enc_np = encode(imgs_np, device, states_np)
                 scaler.partial_fit(enc_np)
                 ipca.partial_fit(scaler.transform(enc_np))
             print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
@@ -245,8 +599,8 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
         for i in range(len(dataset_source)):
             if i % 200 == 0:
                 print(f"  Episode {i}/{len(dataset_source)}")
-            imgs_np, d = get_sample(args, dataset_source, i)
-            enc_np = transform_enc(encoder.encode(imgs_np, device), scaler, ipca, args.no_pca)
+            imgs_np, d, states_np = get_sample(args, dataset_source, i)
+            enc_np = transform_enc(encode(imgs_np, device, states_np), scaler, ipca, args.no_pca)
 
             safe_mask   = (d ==  1)
             unsafe_mask = (d == -1)
@@ -356,13 +710,38 @@ if __name__ == "__main__":
         enc_kwargs["checkpoint_path"] = args.ts_ckpt
         enc_kwargs["img_size"]        = args.ts_img_size
 
-    print(f"Loading encoder: {args.encoder} ...")
-    encoder = build_encoder(args.encoder, **enc_kwargs)
+    if args.encoder == "gt_state":
+        encoder = None
+        print("gt-state encoder: skipping image encoder build.")
+    else:
+        print(f"Loading encoder: {args.encoder} ...")
+        encoder = build_encoder(args.encoder, **enc_kwargs)
 
     if args.dataset_mode == "npz":
         dataset_source = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
         print(f"Found {len(dataset_source)} episodes.")
-    else:
+    elif args.dataset_mode == "wall":
+        if args.wall_config is None:
+            # guess default location next to obses dir
+            args.wall_config = os.path.join(
+                os.path.dirname(args.wall_obses_dir.rstrip("/")),
+                "wall_config.pkl"
+            )
+        cfg = load_wall_config(args.wall_config)
+
+        dataset_source = WallDatasetSource(
+            obses_dir       = args.wall_obses_dir,
+            states_path     = args.wall_states,
+            wall_path       = args.wall_locs,
+            door_path       = args.door_locs,
+            ball_radius     = cfg.env.get("ball_radius",     1.0),
+            door_half_w     = cfg.env.get("door_space",      4.0),
+            env_size        = cfg.env.get("img_size",        64.0),
+            wall_width      = cfg.env.get("wall_width",      4.0),
+            border_wall_loc = cfg.env.get("border_wall_loc", 2.0),
+        )
+        print(f"Wall dataset: {len(dataset_source)} episodes.")
+    elif args.dataset_mode == "ts":
         dataset_source = load_ts_dataset(args)
 
     config = SimpleNamespace(

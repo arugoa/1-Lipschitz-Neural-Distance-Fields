@@ -202,12 +202,12 @@ def load_img_tensor(path, img_size, transform, device):
     return img_t.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, C, H, W)
 
 
-def img_to_latent(wm, img_t):
+def img_to_latent(wm, img_t, state_gt):
     """
     img_t: (1, 1, C, H, W)
     Returns z: (1, emb_dim) — CLS or mean-pooled patch token
     """
-    obs = {"visual": img_t}
+    obs = {"visual": img_t, "proprio": state_gt}
     with torch.no_grad():
         z_dict = wm.encode_obs(obs)
     # z_dict is typically {"visual": (1, 1, num_patches, emb_dim)} or (1, 1, emb_dim)
@@ -228,6 +228,8 @@ def load_start_goal_from_npz(npz_path, img_size):
     images  = file["image"]          # (T, H, W, C)
     start_np = images[0]              # first frame
     goal_np  = images[-1]             # last frame
+    start_state_gt = torch.from_numpy(file["state"][0])
+    goal_state_gt = torch.from_numpy(file["state"][-1])
 
     # resize if needed
     if start_np.shape[0] != img_size:
@@ -241,7 +243,7 @@ def load_start_goal_from_npz(npz_path, img_size):
 
     print(f"Loaded episode: {images.shape[0]} frames, "
           f"start={start_np.shape}, goal={goal_np.shape}")
-    return start_np, goal_np
+    return start_np, goal_np, start_state_gt, goal_state_gt
 
 
 def np_to_img_tensor(arr_np, device):
@@ -516,7 +518,7 @@ if __name__ == "__main__":
     # ── Encode start and goal ─────────────────────────────────────────────
     print("Encoding start and goal...")
     if args.npz:
-        start_np, goal_np = load_start_goal_from_npz(args.npz, args.img_size)
+        start_np, goal_np, start_state_gt, goal_state_gt = load_start_goal_from_npz(args.npz, args.img_size)
         start_img_t = np_to_img_tensor(start_np, device)
         goal_img_t  = np_to_img_tensor(goal_np,  device)
     elif args.start_img and args.goal_img:
@@ -527,8 +529,8 @@ if __name__ == "__main__":
     else:
         raise ValueError("Provide either --npz or both --start-img and --goal-img")
 
-    z_start = img_to_latent(wm, start_img_t)   # (1, emb_dim)
-    z_goal  = img_to_latent(wm, goal_img_t)    # (1, emb_dim)
+    z_start = img_to_latent(wm, start_img_t, start_state_gt)   # (1, emb_dim)
+    z_goal  = img_to_latent(wm, goal_img_t, goal_state_gt)    # (1, emb_dim)
 
     x_start = to_pca(z_start.cpu().numpy(), scaler, ipca, no_pca).squeeze(0)
     x_goal  = to_pca(z_goal.cpu().numpy(),  scaler, ipca, no_pca).squeeze(0)

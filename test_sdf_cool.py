@@ -26,8 +26,16 @@ def get_args():
     parser = argparse.ArgumentParser(description="Unified SDF evaluation")
 
     parser.add_argument("dataset", type=str, help="Path to dataset folder", default="../../sold-sam/dataset/")
-    parser.add_argument("--dataset-mode", choices=["npz", "ts"], default="npz")
-    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts"],
+    parser.add_argument("--dataset-mode", choices=["npz", "ts", "wall"], default="npz")
+    parser.add_argument("--state-key",      type=str, default="state")
+    parser.add_argument("--wall-obses-dir", type=str, default=None)
+    parser.add_argument("--wall-states",    type=str, default=None)
+    parser.add_argument("--wall-locs",      type=str, default=None)
+    parser.add_argument("--door-locs",      type=str, default=None)
+    parser.add_argument("--wall-config",    type=str, default=None)
+    parser.add_argument("--margin",         type=float, default=1.5)
+
+    parser.add_argument("--encoder", choices=["cjepa", "dreamer", "autoencoder", "lewm", "ts", "gt-state"],
                         default="cjepa")
     parser.add_argument("--cjepa-ckpt", type=str, default="clevrer_savi_model.pth")
     parser.add_argument("--dreamer-ckpt", type=str, default=None)
@@ -134,8 +142,38 @@ if __name__ == "__main__":
         enc_kwargs["checkpoint_path"] = args.ts_ckpt
         enc_kwargs["img_size"]        = args.ts_img_size
 
-    print(f"Loading encoder: {args.encoder} ...")
-    encoder = build_encoder(args.encoder, **enc_kwargs)
+    if args.encoder == "gt-state":
+        encoder = None
+        print("gt-state encoder: skipping image encoder build.")
+    else:
+        print(f"Loading encoder: {args.encoder} ...")
+        encoder = build_encoder(args.encoder, **enc_kwargs)
+
+    if args.dataset_mode == "npz":
+        files = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
+        num_train = int(len(files) * 0.7)
+        dataset_source = files[num_train:]
+        print(f"Evaluating on {len(dataset_source)} npz test episodes...")
+    elif args.dataset_mode == "wall":
+        from train_lip_cool import (WallDatasetSource, load_wall_config,
+                                    compute_dones_from_geometry, is_near_wall,
+                                    check_wall_intersect)
+        cfg = load_wall_config(args.wall_config)
+        dataset_source = WallDatasetSource(
+            obses_dir       = args.wall_obses_dir,
+            states_path     = args.wall_states,
+            wall_path       = args.wall_locs,
+            door_path       = args.door_locs,
+            ball_radius     = cfg.env.get("ball_radius",     1.0),
+            door_half_w     = cfg.env.get("door_space",      4.0),
+            env_size        = cfg.env.get("img_size",        64.0),
+            wall_width      = cfg.env.get("wall_width",      4.0),
+            border_wall_loc = cfg.env.get("border_wall_loc", 2.0),
+        )
+        print(f"Evaluating on {len(dataset_source)} wall episodes...")
+    else:
+        dataset_source = load_ts_dataset(args)
+        print(f"Evaluating on {len(dataset_source)} TS episodes...")
 
     # ── Load PCA pipeline saved by train_lip.py ───────────────────────────
     pca_path = os.path.join(args.run_dir, "pca_pipeline.pkl")
@@ -150,54 +188,87 @@ if __name__ == "__main__":
     sdf = load_model(args.model, device)
     sdf.eval()
 
-    # ── Encode test episodes on-the-fly ───────────────────────────────────
-    if args.dataset_mode == "npz":
-        files         = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
-        num_train     = int(len(files) * 0.7)
-        dataset_source = files[num_train:]
-        print(f"Evaluating on {len(dataset_source)} npz test episodes...")
-    else:
-        dataset_source = load_ts_dataset(args)
-        print(f"Evaluating on {len(dataset_source)} TS episodes...")
+    # # ── Encode test episodes on-the-fly ───────────────────────────────────
+    # if args.dataset_mode == "npz":
+    #     files         = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
+    #     num_train     = int(len(files) * 0.7)
+    #     dataset_source = files[num_train:]
+    #     print(f"Evaluating on {len(dataset_source)} npz test episodes...")
+    # else:
+    #     dataset_source = load_ts_dataset(args)
+    #     print(f"Evaluating on {len(dataset_source)} TS episodes...")
  
-    # ── Single evaluation loop ────────────────────────────────────────────
-    preds_all  = []
-    labels_all = []
+    # # ── Single evaluation loop ────────────────────────────────────────────
+    # preds_all  = []
+    # labels_all = []
  
-    for i in range(len(dataset_source)):
-        if i % 100 == 0:
-            print(f"  Episode {i}/{len(dataset_source)}")
+    # for i in range(len(dataset_source)):
+    #     if i % 100 == 0:
+    #         print(f"  Episode {i}/{len(dataset_source)}")
  
-        if args.dataset_mode == "npz":
-            file    = np.load(dataset_source[i], allow_pickle=True)
-            imgs_np = file["image"]
-            d       = np.where(file["dones"] == 0, 1, -1)
-        else:
-            sample  = dataset_source[i]
-            imgs_np = sample["image"]
-            if torch.is_tensor(imgs_np):
-                imgs_np = imgs_np.cpu().numpy()
-            d = np.where(sample["dones"] == 0, 1, -1)
- 
-        if ipca is None:
-            enc_np = encoder.encode(imgs_np, device)
-        else:
-            enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
- 
-        enc_t = torch.from_numpy(enc_np.astype("float32")).to(device)
- 
-        with torch.no_grad():
-            preds = sdf(enc_t).squeeze(-1).cpu()
- 
-        preds_all.append(preds)
-        labels_all.append(torch.from_numpy(d.astype("float32")))
- 
-    preds  = torch.cat(preds_all)
-    labels = torch.cat(labels_all)
+    #     if args.dataset_mode == "npz":
+    #         file      = np.load(dataset_source[i], allow_pickle=True)
+    #         imgs_np   = file["image"]
+    #         d         = np.where(file["dones"] == 0, 1, -1)
+    #         states_np = file[args.state_key] if args.state_key in file else None
+    #     elif args.dataset_mode == "wall":
+    #         sample    = dataset_source[i]
+    #         imgs_np   = sample["image"]
+    #         d         = np.where(sample["dones"] == 0, 1, -1)
+    #         states_np = dataset_source.states[i]
+    #     else:
+    #         sample    = dataset_source[i]
+    #         imgs_np   = sample["image"]
+    #         if torch.is_tensor(imgs_np):
+    #             imgs_np = imgs_np.cpu().numpy()
+    #         d         = np.where(sample["dones"] == 0, 1, -1)
+    #         states_np = None
 
-    np.save(os.path.join(args.run_dir, "test_preds.npy"),  preds)
-    np.save(os.path.join(args.run_dir, "test_labels.npy"), labels)
-    print(f"Saved preds and labels to {args.run_dir}")
+    #     if args.encoder == "gt-state":
+    #         enc_np = np.array(states_np, dtype=np.float32).reshape(len(states_np), -1)
+    #     elif ipca is None:
+    #         enc_np = encoder.encode(imgs_np, device)
+    #     else:
+    #         enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
+ 
+    #     enc_t = torch.from_numpy(enc_np.astype("float32")).to(device)
+ 
+    #     with torch.no_grad():
+    #         preds = sdf(enc_t).squeeze(-1).cpu()
+ 
+    #     preds_all.append(preds)
+    #     labels_all.append(torch.from_numpy(d.astype("float32")))
+ 
+    # preds  = torch.cat(preds_all)
+    # labels = torch.cat(labels_all)
+
+    # np.save(os.path.join(args.run_dir, "test_preds.npy"),  preds)
+    # np.save(os.path.join(args.run_dir, "test_labels.npy"), labels)
+    # print(f"Saved preds and labels to {args.run_dir}")
+
+    # print(f"\n── Results: {args.encoder} | {args.run_dir} ──")
+    # evaluate(preds, labels)
+    
+    # ── Load saved test set from train output ─────────────────────────────
+    X_test = np.load(os.path.join(args.run_dir, "X_test.npy"), mmap_mode="r")
+    y_test = np.load(os.path.join(args.run_dir, "y_test.npy"), mmap_mode="r")
+    print(f"Loaded test set: {X_test.shape[0]} frames")
+
+    enc_t  = torch.from_numpy(np.array(X_test, dtype="float32"))
+    labels = torch.from_numpy(np.array(y_test, dtype="float32"))
+
+    # ── Run inference in batches ──────────────────────────────────────────
+    preds_list = []
+    for start in range(0, len(enc_t), args.test_batch_size):
+        batch = enc_t[start : start + args.test_batch_size].to(device)
+        with torch.no_grad():
+            preds_list.append(sdf(batch).squeeze(-1).cpu())
+    preds = torch.cat(preds_list)
+
+    # ── Save for visualize_test.py ────────────────────────────────────────
+    np.save(os.path.join(args.run_dir, "test_preds.npy"),  preds.numpy())
+    np.save(os.path.join(args.run_dir, "test_labels.npy"), labels.numpy())
+    print(f"Saved test_preds.npy and test_labels.npy to {args.run_dir}")
 
     print(f"\n── Results: {args.encoder} | {args.run_dir} ──")
     evaluate(preds, labels)
