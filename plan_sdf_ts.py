@@ -98,6 +98,175 @@ def get_args():
     return parser.parse_args()
 
 
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.neighbors import KDTree
+
+
+def plot_rrt_in_state_space(
+    rrt_latents,
+    run_dir,
+    out_dir,
+    save_path=None,
+    k=5,
+    show_dataset=True,
+    show_numbers=False,
+    wm=False
+):
+    """
+    Visualize a latent-space trajectory in ground-truth state coordinates
+    using nearest-neighbor lookup.
+
+    Parameters
+    ----------
+    rrt_latents : (N,D) ndarray
+        Latent trajectory from RRT or optimization.
+
+    run_dir : str
+        Directory containing
+            X_train_in.npy
+            X_train_out.npy
+            State_in.npy
+            State_out.npy
+
+    save_path : str or None
+        Defaults to run_dir/rrt_state_space.png
+
+    k : int
+        Number of nearest neighbors used for interpolation.
+        k=1 gives nearest neighbor.
+        k=5 usually looks much smoother.
+
+    show_dataset : bool
+        Draw all stored states in the background.
+
+    show_numbers : bool
+        Draw waypoint indices.
+    """
+
+    # --------------------------------------------------
+    # load dataset
+    # --------------------------------------------------
+
+    X_safe = np.load(os.path.join(run_dir, "X_train_in.npy"), mmap_mode="r")
+    X_bad  = np.load(os.path.join(run_dir, "X_train_out.npy"), mmap_mode="r")
+
+    S_safe = np.load(os.path.join(run_dir, "State_in.npy"), mmap_mode="r")
+    S_bad  = np.load(os.path.join(run_dir, "State_out.npy"), mmap_mode="r")
+
+    X = np.vstack([X_safe, X_bad])
+    S = np.vstack([S_safe, S_bad])
+
+    # --------------------------------------------------
+    # nearest-neighbor lookup
+    # --------------------------------------------------
+
+    tree = KDTree(X)
+
+    dist, ind = tree.query(rrt_latents, k=k)
+
+    if k == 1:
+        traj = S[ind[:, 0]]
+    else:
+        weights = 1.0 / (dist + 1e-8)
+        weights /= weights.sum(axis=1, keepdims=True)
+
+        traj = (weights[:, :, None] * S[ind]).sum(axis=1)
+
+    # --------------------------------------------------
+    # plotting
+    # --------------------------------------------------
+
+    plt.figure(figsize=(8, 8))
+
+    if show_dataset:
+        plt.scatter(
+            S_safe[:, 0],
+            S_safe[:, 1],
+            s=2,
+            alpha=0.15,
+            color="tab:blue",
+            label="safe states",
+        )
+
+        plt.scatter(
+            S_bad[:, 0],
+            S_bad[:, 1],
+            s=4,
+            alpha=0.25,
+            color="tab:red",
+            label="unsafe states",
+        )
+
+    # trajectory
+    plt.plot(
+        traj[:, 0],
+        traj[:, 1],
+        "-k",
+        linewidth=2,
+        label="planned trajectory",
+        zorder=10,
+    )
+
+    # color by timestep
+    plt.scatter(
+        traj[:, 0],
+        traj[:, 1],
+        c=np.arange(len(traj)),
+        cmap="viridis",
+        s=60,
+        edgecolors="k",
+        linewidths=0.5,
+        zorder=20,
+    )
+
+    # start / goal
+    plt.scatter(
+        traj[0, 0],
+        traj[0, 1],
+        marker="o",
+        s=180,
+        color="lime",
+        edgecolors="k",
+        label="start",
+        zorder=30,
+    )
+
+    plt.scatter(
+        traj[-1, 0],
+        traj[-1, 1],
+        marker="*",
+        s=250,
+        color="gold",
+        edgecolors="k",
+        label="goal",
+        zorder=30,
+    )
+
+    if show_numbers:
+        for i, p in enumerate(traj):
+            plt.text(p[0], p[1], str(i), fontsize=8)
+
+    plt.axis("equal")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title("Planner trajectory projected to state space")
+    plt.legend()
+
+    if save_path is None:
+        if not wm:
+            save_path = os.path.join(out_dir, "rrt_state_space.png")
+        else:
+            save_path = os.path.join(out_dir, "wm_state_space.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+    print(f"Saved {save_path}")
+
+    return traj
+
 # ── TS model loading ───────────────────────────────────────────────────────
 
 def setup_ts_paths(ts_repo, model_path):
@@ -334,7 +503,7 @@ def from_pca_sdf(pca_pts, sdf, device):
     t = torch.from_numpy(pca_pts.astype("float32")).to(device)
     with torch.no_grad():
         vals = sdf(t).squeeze(-1).cpu().numpy()
-    return -vals
+    return vals
 
 
 # ── RRT ───────────────────────────────────────────────────────────────────
@@ -459,7 +628,7 @@ def optimise_rollout(
             p_t   = torch.from_numpy(p_np).float().to(device)
             with torch.no_grad():
                 sdf_v = sdf(p_t).squeeze(-1)
-            safety_loss = F.relu(-sdf_v + 0.0).mean()
+            safety_loss = F.relu(sdf_v + 0.0).mean()
 
         loss = goal_loss + safety_weight * safety_loss
         loss.backward()
@@ -646,6 +815,12 @@ if __name__ == "__main__":
     rrt_sdf = from_pca_sdf(np.stack(rrt_path), sdf, device)
     print(f"RRT path: {len(rrt_path)} waypoints  "
           f"SDF min={rrt_sdf.min():.4f}  mean={rrt_sdf.mean():.4f}")
+    
+    traj_states = plot_rrt_in_state_space(
+        rrt_latents=rrt_path,
+        run_dir=args.run_dir,
+        out_dir=args.out_dir,
+        k=5)
 
     # ── WM rollout ────────────────────────────────────────────────────────
     action_seq = None
@@ -672,6 +847,12 @@ if __name__ == "__main__":
             safety_weight = args.safety_weight,
             preprocessor  = preprocessor,
         )
+        traj_states = plot_rrt_in_state_space(
+            rrt_latents=rollout_pca,
+            run_dir=args.run_dir,
+            out_dir=args.out_dir,
+            k=5,
+            wm=True)
 
     pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
     print(f"Path: {len(rollout_pca)} steps  "
