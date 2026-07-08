@@ -24,6 +24,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from sklearn.decomposition import PCA
 
 from common.models import load_model
 from common.utils import get_device
@@ -37,6 +38,8 @@ def get_args():
                         help="SDF model path. Auto-detected from run-dir if omitted.")
     parser.add_argument("--n-sample", type=int, default=8000,
                         help="Max points to use in boundary plots")
+    parser.add_argument("--state-xy", nargs=2, type=int, default=[0, 1],
+                        help="Which two state dims are X, Y for the comparison plot")
     parser.add_argument("-cpu", action="store_true")
     return parser.parse_args()
 
@@ -169,7 +172,7 @@ def plot_boundary_2d(sdf, X_in, X_out, run_dir, device, n_sample=8000):
     zz   = run_sdf(sdf, grid, device).reshape(res, res)
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    cf = ax.contourf(xx, yy, zz, levels=50, cmap="RdBu_r", alpha=0.85)
+    cf = ax.contourf(xx, yy, zz)
     ax.contour(xx, yy, zz, levels=[0], colors="black", linewidths=1.5)
     plt.colorbar(cf, ax=ax, label="SDF score")
 
@@ -190,9 +193,13 @@ def plot_boundary_2d(sdf, X_in, X_out, run_dir, device, n_sample=8000):
 # ── 5. Decision boundary slice (for pca_dim >= 3) ─────────────────────────
 
 def plot_boundary_slice(sdf, X_in, X_out, run_dir, device, n_sample=8000):
-    """Slice at median PC3 value to show 2D boundary in (PC1, PC2) plane."""
     all_X = np.vstack([X_in, X_out])
-    pc3_median = float(np.median(all_X[:, 2]))
+    
+    # Fit PCA on all training data → meaningful 2D projection
+    pca = PCA(n_components=2)
+    pca.fit(all_X)
+    evr = pca.explained_variance_ratio_
+    print(f"PCA explained variance: PC1={evr[0]:.3f}, PC2={evr[1]:.3f}, total={evr.sum():.3f}")
 
     rng = np.random.default_rng(42)
     def s(X):
@@ -201,35 +208,117 @@ def plot_boundary_slice(sdf, X_in, X_out, run_dir, device, n_sample=8000):
     X_in_s  = s(X_in)
     X_out_s = s(X_out)
 
-    pad = (all_X[:, :2].max(0) - all_X[:, :2].min(0)) * 0.1
-    x_min, y_min = all_X[:, :2].min(0) - pad
-    x_max, y_max = all_X[:, :2].max(0) + pad
+    # Project sampled points into PCA space for scatter
+    X_in_2d  = pca.transform(X_in_s)
+    X_out_2d = pca.transform(X_out_s)
+
+    # Build grid in PCA space, then invert back to embedding space for SDF query
+    all_2d = pca.transform(all_X)
+    pad    = (all_2d.max(0) - all_2d.min(0)) * 0.1
+    x_min, y_min = all_2d.min(0) - pad
+    x_max, y_max = all_2d.max(0) + pad
 
     res = 250
     xx, yy = np.meshgrid(np.linspace(x_min, x_max, res),
                          np.linspace(y_min, y_max, res))
-    extras = np.full((res * res, all_X.shape[1] - 2), pc3_median, dtype="float32")
-    grid   = np.hstack([np.c_[xx.ravel(), yy.ravel()].astype("float32"), extras])
-    zz     = run_sdf(sdf, grid, device).reshape(res, res)
+    grid_2d = np.c_[xx.ravel(), yy.ravel()].astype("float32")
+
+    # Invert PCA to get embedding-space points for SDF evaluation
+    grid_full = pca.inverse_transform(grid_2d).astype("float32")
+    zz = run_sdf(sdf, grid_full, device).reshape(res, res)
 
     fig, ax = plt.subplots(figsize=(7, 6))
     cf = ax.contourf(xx, yy, zz, levels=50, cmap="RdBu_r", alpha=0.85)
     ax.contour(xx, yy, zz, levels=[0], colors="black", linewidths=1.5)
     plt.colorbar(cf, ax=ax, label="SDF score")
 
-    ax.scatter(X_out_s[:, 0], X_out_s[:, 1], s=4, alpha=0.35,
+    ax.scatter(X_out_2d[:, 0], X_out_2d[:, 1], s=4, alpha=0.35,
                color="#F44336", label="Unsafe", rasterized=True)
-    ax.scatter(X_in_s[:, 0],  X_in_s[:, 1],  s=4, alpha=0.35,
+    ax.scatter(X_in_2d[:, 0],  X_in_2d[:, 1],  s=4, alpha=0.35,
                color="#2196F3", label="Safe",   rasterized=True)
 
-    ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
-    ax.set_title(f"Decision Boundary Slice @ PC3={pc3_median:.2f}\n{os.path.basename(run_dir)}")
+    ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}%)", fontsize=11)
+    ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}%)", fontsize=11)
+    ax.set_title(f"Decision Boundary (PCA projection)\n{os.path.basename(run_dir)}")
     ax.legend(markerscale=3)
     plt.tight_layout()
     path = os.path.join(run_dir, "decision_boundary_slice.png")
     plt.savefig(path, dpi=150); plt.close()
     print(f"Saved: {path}")
 
+
+def plot_state_space_sdf(
+    sdf,
+    run_dir,
+    device,
+    state_xy=(0, 1),
+    n_sample=20000,
+):
+    """
+    Plot the SDF value of every test point at its ground-truth state
+    coordinates.
+    """
+
+    X = np.load(os.path.join(run_dir, "X_test.npy"), mmap_mode="r")
+    states = np.load(os.path.join(run_dir, "State_test.npy"), mmap_mode="r")
+    labels = np.load(os.path.join(run_dir, "y_test.npy"), mmap_mode="r")
+
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(X), min(n_sample, len(X)), replace=False)
+
+    X = X[idx]
+    states = states[idx]
+    labels = labels[idx]
+
+    sdf_vals = run_sdf(sdf, X, device)
+
+    xi, yi = state_xy
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    sc = ax.scatter(
+        states[:, xi],
+        states[:, yi],
+        c=sdf_vals,
+        cmap="RdBu_r",
+        s=8,
+        alpha=0.8,
+        rasterized=True,
+    )
+
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label("SDF value")
+
+    # Optional: draw misclassified samples
+    pred_safe = sdf_vals > 0
+    true_safe = labels > 0
+    wrong = pred_safe != true_safe
+
+    # ax.scatter(
+    #     states[wrong, xi],
+    #     states[wrong, yi],
+    #     marker="x",
+    #     s=20,
+    #     color="k",
+    #     linewidth=0.8,
+    #     label=f"Misclassified ({wrong.sum()})",
+    # )
+
+    ax.set_xlabel("State X")
+    ax.set_ylabel("State Y")
+    ax.set_aspect("equal")
+
+    ax.set_title(
+        f"SDF values projected on state space\n{os.path.basename(run_dir)}"
+    )
+
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "state_space_sdf.png"), dpi=200)
+    plt.close()
+
+    print("Saved:", os.path.join(run_dir, "state_space_sdf.png"))
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
@@ -275,5 +364,7 @@ if __name__ == "__main__":
         plot_boundary_2d(sdf, X_in, X_out, run, device, args.n_sample)
     elif pca_dim >= 3:
         plot_boundary_slice(sdf, X_in, X_out, run, device, args.n_sample)
+
+    plot_state_space_sdf(sdf, run, device)
 
     print("\nDone. All figures saved inside the run directory.")

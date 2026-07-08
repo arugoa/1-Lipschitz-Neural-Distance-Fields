@@ -20,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
+from sklearn.decomposition import PCA
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -79,8 +79,14 @@ def plot_scatter_2d(run_dir, n_sample):
     X_out = np.load(os.path.join(run_dir, "X_train_out.npy"), mmap_mode="r")
     pca_dim = X_in.shape[1]
 
-    X_in_s  = sample(X_in,  n_sample)
-    X_out_s = sample(X_out, n_sample)
+    all_X = np.vstack([X_in, X_out])
+    
+    # Fit PCA on all training data → meaningful 2D projection
+    pca = PCA(n_components=2)
+    pca.fit(all_X)
+
+    X_in_s  = pca.transform(sample(X_in,  n_sample))
+    X_out_s = pca.transform(sample(X_out, n_sample))
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(X_out_s[:, 0], X_out_s[:, 1], s=5, alpha=0.35,
@@ -175,6 +181,6 @@ if __name__ == "__main__":
     print(f"\nVisualizing training for: {run}\n")
     plot_loss(run)
     plot_scatter_2d(run, args.n_sample)
-    plot_scatter_3d(run, args.n_sample)
+    # plot_scatter_3d(run, args.n_sample)
     plot_class_balance(run)
     print("\nDone. All figures saved inside the run directory.")

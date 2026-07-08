@@ -123,18 +123,13 @@ class TemporalStraighteningFrameDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         obs, act, state = self.ts_dataset[idx]
-
         imgs = obs["visual"]
-
         if torch.is_tensor(imgs):
             imgs = imgs.cpu().numpy()
-
+        if torch.is_tensor(state):
+            state = state.cpu().numpy()
         dones = np.zeros(len(imgs), dtype=np.int32)
-
-        return {
-            "image": imgs,
-            "dones": dones,
-        }
+        return {"image": imgs, "dones": dones, "states": state}
 
 
 import pickle
@@ -443,7 +438,7 @@ class WallDatasetSource:
 
         # trim to same length in case images has an extra frame
         T = min(len(imgs), len(dones))
-        return {"image": imgs[:T], "dones": dones[:T]}
+        return {"image": imgs[:T], "dones": dones[:T], "states": self.states[idx][:T]}
 
 
 def load_ts_dataset(args):
@@ -474,22 +469,17 @@ def get_sample(args, dataset_source, idx):
     if args.dataset_mode == "npz":
         fp = dataset_source[idx]
         file = np.load(fp, allow_pickle=True)
-        imgs_np    = file["image"]
-        d          = np.where(file["dones"] == 0, 1, -1)
-        states_np  = file[args.state_key] if args.state_key in file else None
-    elif args.dataset_mode == "wall":
-        sample     = dataset_source[idx]
-        imgs_np    = sample["image"]
-        d          = np.where(sample["dones"] == 0, 1, -1)
-        states_np  = dataset_source.states[idx]
+        imgs_np = file["images"]
+        d = np.where(file["dones"] == 0, 1, -1)
+        states = file["states"] if "states" in file else None
     else:
-        sample     = dataset_source[idx]
-        imgs_np    = sample["image"]
+        sample = dataset_source[idx]
+        imgs_np = sample["image"]
         if torch.is_tensor(imgs_np):
             imgs_np = imgs_np.cpu().numpy()
-        d          = np.where(sample["dones"] == 0, 1, -1)
-        states_np  = None
-    return imgs_np, d, states_np
+        d = np.where(sample["dones"] == 0, 1, -1)
+        states = sample.get("states", None)
+    return imgs_np, d, states
 
 
 def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
@@ -532,7 +522,7 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
     print(f"{'='*60}")
 
     mm = {k: os.path.join(out_folder, f"{k}.npy") for k in
-          ["X_train_in", "X_train_out", "X_test", "y_test"]}
+          ["X_train_in", "State_in", "State_out", "X_train_out", "X_test", "State_test", "y_test"]}
     pca_path = os.path.join(out_folder, "pca_pipeline.pkl")
 
     data_ready = (not args.force_encode) and all(os.path.exists(p) for p in [*mm.values(), pca_path])
@@ -575,7 +565,7 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
                 if i % 100 == 0:
                     print(f"  PCA fit {i}/{len(dataset_source)}")
                 imgs_np, _, _ = get_sample(args, dataset_source, i)
-                enc_np = encode(imgs_np, device, states_np)
+                enc_np = encode(imgs_np, device, None)
                 scaler.partial_fit(enc_np)
                 ipca.partial_fit(scaler.transform(enc_np))
             print(f"Explained variance: {ipca.explained_variance_ratio_.sum():.4f}")
@@ -585,10 +575,13 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
         print(f"PCA pipeline saved to {pca_path}")
 
         # ── 3. Allocate memmaps ───────────────────────────────────────────
-        mm_in   = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_safe_train,   pca_dim))
-        mm_out  = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_unsafe_train, pca_dim))
-        mm_test = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test,         pca_dim))
-        mm_yt   = np.lib.format.open_memmap(mm["y_test"],      mode="w+", dtype="float32", shape=(n_test,))
+        mm_in     = np.lib.format.open_memmap(mm["X_train_in"],  mode="w+", dtype="float32", shape=(n_safe_train,   pca_dim))
+        mm_s_in   = np.lib.format.open_memmap(mm["State_in"],    mode="w+", dtype="float32", shape=(n_safe_train,   2))
+        mm_out    = np.lib.format.open_memmap(mm["X_train_out"], mode="w+", dtype="float32", shape=(n_unsafe_train, pca_dim))
+        mm_s_out  = np.lib.format.open_memmap(mm["State_out"],   mode="w+", dtype="float32", shape=(n_unsafe_train,   2))
+        mm_test   = np.lib.format.open_memmap(mm["X_test"],      mode="w+", dtype="float32", shape=(n_test,         pca_dim))
+        mm_s_test = np.lib.format.open_memmap(mm["State_test"],  mode="w+", dtype="float32", shape=(n_test,   2))
+        mm_yt     = np.lib.format.open_memmap(mm["y_test"],      mode="w+", dtype="float32", shape=(n_test,))
 
         # ── 4. Encode → (PCA) → write, filling train first then test ──────
         # We fill train slots until each class hits its 70% quota,
@@ -608,18 +601,26 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
             safe_enc   = enc_np[safe_mask]
             unsafe_enc = enc_np[unsafe_mask]
 
+            safe_states   = states_np[safe_mask]
+            unsafe_states = states_np[unsafe_mask]
+
             # Safe frames: fill train first, overflow to test
-            for chunk, enc in [("safe", safe_enc), ("unsafe", unsafe_enc)]:
+            for chunk, enc, states in [
+                ("safe", safe_enc, safe_states),
+                ("unsafe", unsafe_enc, unsafe_states),
+            ]:
                 if chunk == "safe":
                     n_train_quota = n_safe_train
                     idx_train     = idx_in
                     label_val     = 1.0
                     mm_train      = mm_in
+                    mm_s_train    = mm_s_in
                 else:
                     n_train_quota = n_unsafe_train
                     idx_train     = idx_out
                     label_val     = -1.0
                     mm_train      = mm_out
+                    mm_s_train    = mm_s_out
 
                 if len(enc) == 0:
                     continue
@@ -630,9 +631,11 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
 
                 if n_to_train > 0:
                     mm_train[idx_train:idx_train + n_to_train] = enc[:n_to_train]
+                    mm_s_train[idx_train:idx_train + n_to_train] = states[:n_to_train]
 
                 if n_to_test > 0:
                     mm_test[idx_test:idx_test + n_to_test] = enc[n_to_train:]
+                    mm_s_test[idx_test:idx_test + n_to_test] = states[n_to_train:n_to_train+n_to_test]
                     mm_yt  [idx_test:idx_test + n_to_test] = label_val
 
                 if chunk == "safe":
@@ -642,7 +645,7 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
                     idx_out   += n_to_train
                     idx_test  += n_to_test
 
-        del mm_in, mm_out, mm_test, mm_yt
+        del mm_in, mm_out, mm_test, mm_yt, mm_s_in, mm_s_out, mm_s_test
         print(f"Done → train_in: {idx_in}, train_out: {idx_out}, test: {idx_test}")
 
     # ── 5. DataLoaders ────────────────────────────────────────────────────

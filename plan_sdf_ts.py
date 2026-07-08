@@ -23,6 +23,7 @@ import sys
 import argparse
 import pickle
 import numpy as np
+import glob
 import torch
 import torch.nn.functional as F
 import matplotlib
@@ -52,13 +53,28 @@ def get_args():
     
 
     # start / goal images
+    # add to get_args():
+    parser.add_argument("--encoder",     choices=["ts", "gt-state"], default="ts")
+    parser.add_argument("--state-start", type=float, nargs=2, default=None,
+                        help="Start XY state in world coords, e.g. --state-start 45.0 23.0")
+    parser.add_argument("--state-goal",  type=float, nargs=2, default=None,
+                        help="Goal XY state in world coords")
+    parser.add_argument("--wall-npz",    type=str, default=None,
+                        help="Wall .npz episode — uses first/last state as start/goal")
+
     parser.add_argument("--npz",       type=str, default=None,
                     help="Path to .npz episode — uses first frame as start, last as goal")
     parser.add_argument("--start-img", type=str, default=None,
                         help="Path to start image (overrides --npz)")
     parser.add_argument("--goal-img",  type=str, default=None,
                         help="Path to goal image (overrides --npz)")
-    parser.add_argument("--img-size",    type=int, default=128)
+    parser.add_argument("--img-size",    type=int, default=224)
+
+    parser.add_argument("--wall-episode-idx", type=int, default=0,
+                    help="Which episode index to plan for")
+    parser.add_argument("--wall-obses-dir",   type=str, default=None)
+    parser.add_argument("--wall-states-path", type=str, default=None,
+                        help="Path to states.pth (N, T, 2)")
 
     # SDF
     parser.add_argument("--run-dir",     type=str, required=True)
@@ -66,9 +82,9 @@ def get_args():
 
     # RRT
     parser.add_argument("--rrt-iters",   type=int,   default=5000)
-    parser.add_argument("--rrt-step",    type=float, default=0.05)
-    parser.add_argument("--sdf-margin",  type=float, default=0.0)
-    parser.add_argument("--goal-radius", type=float, default=0.1)
+    parser.add_argument("--rrt-step",    type=float, default=0.5)
+    parser.add_argument("--sdf-margin",  type=float, default=0.001)
+    parser.add_argument("--goal-radius", type=float, default=0.5)
 
     # WM rollout optimisation
     parser.add_argument("--rollout-steps", type=int,   default=30)
@@ -96,6 +112,55 @@ def setup_ts_paths(ts_repo, model_path):
 ALL_MODEL_KEYS = [
     "encoder", "predictor", "decoder", "proprio_encoder", "action_encoder",
 ]
+
+
+def load_wall_episode(obses_dir, states_path, episode_idx, img_size, device):
+    """
+    Load a single wall episode for both ts and gt_state encoders.
+    
+    Returns:
+        start_img_t  : (1, 1, C, H, W) float tensor  — for ts encoder
+        goal_img_t   : (1, 1, C, H, W) float tensor  — for ts encoder
+        start_state  : (2,) numpy                     — for gt_state encoder
+        goal_state   : (2,) numpy                     — for gt_state encoder
+        all_states   : (T, 2) numpy                   — full trajectory
+    """
+    import re
+
+    # load images
+    eps = sorted(
+        glob.glob(os.path.join(obses_dir, "*.pth")),
+        key=lambda p: int(re.search(r'(\d+)', os.path.basename(p)).group(1))
+    )
+    imgs = torch.load(eps[episode_idx], map_location="cpu",
+                      weights_only=False).float()   # (T, C, H, W) or (T, H, W, C)
+
+    # normalise to (T, C, H, W) float [0, 1]
+    if imgs.ndim == 4 and imgs.shape[-1] in (3, 4):
+        imgs = imgs.permute(0, 3, 1, 2)             # (T, H, W, C) → (T, C, H, W)
+    if imgs.max() > 1.0:
+        imgs = imgs / 255.0
+
+    # resize if needed
+    if imgs.shape[-1] != img_size:
+        imgs = F.interpolate(imgs, size=(img_size, img_size), mode="bilinear",
+                             align_corners=False)
+
+    start_img_t = imgs[0].unsqueeze(0).unsqueeze(0).to(device)   # (1,1,C,H,W)
+    goal_img_t  = imgs[-1].unsqueeze(0).unsqueeze(0).to(device)  # (1,1,C,H,W)
+
+    # load states
+    all_states  = torch.load(states_path, map_location="cpu",
+                             weights_only=False).numpy()          # (N, T, 2)
+    ep_states   = all_states[episode_idx]                        # (T, 2)
+    start_state = ep_states[0].astype("float32")                 # (2,)
+    goal_state  = ep_states[-1].astype("float32")                # (2,)
+
+    print(f"  Episode {episode_idx}: {len(ep_states)} steps  "
+          f"start={start_state}  goal={goal_state}")
+
+    return start_img_t, goal_img_t, start_state, goal_state, ep_states
+
 
 def load_ckpt(snapshot_path, device):
     import sys, os
@@ -251,6 +316,11 @@ def np_to_img_tensor(arr_np, device):
     t = torch.from_numpy(arr_np).float().permute(2, 0, 1)  # (C, H, W)
     return t.unsqueeze(0).unsqueeze(0).to(device)           # (1, 1, C, H, W)
 
+
+def state_to_latent(xy):
+    """(2,) numpy → (1, 2) float32 numpy — identity for gt_state encoder."""
+    return np.array(xy, dtype="float32").reshape(1, -1)
+
 # ── PCA helpers ───────────────────────────────────────────────────────────
 
 def to_pca(z_np, scaler, ipca, no_pca):
@@ -264,7 +334,7 @@ def from_pca_sdf(pca_pts, sdf, device):
     t = torch.from_numpy(pca_pts.astype("float32")).to(device)
     with torch.no_grad():
         vals = sdf(t).squeeze(-1).cpu().numpy()
-    return vals
+    return -vals
 
 
 # ── RRT ───────────────────────────────────────────────────────────────────
@@ -337,7 +407,7 @@ def rrt(x_start, x_goal, sdf, device, bounds,
 # ── WM rollout optimisation ────────────────────────────────────────────────
 
 def optimise_rollout(
-    wm, start_img_t, goal_latent, sdf,
+    wm, start_img_t, start_proprio, goal_latent, sdf,
     scaler, ipca, no_pca, device,
     rollout_steps, action_dim, frameskip,
     n_optim_steps, lr, safety_weight,
@@ -349,18 +419,24 @@ def optimise_rollout(
     goal_latent:  (1, emb_dim)
     Returns (rollout_pca list, action_seq numpy)
     """
-    total_action_dim = action_dim * frameskip
+    total_action_dim = action_dim   # = 10
     actions = torch.zeros(1, rollout_steps, total_action_dim,
-                          device=device, requires_grad=True)
+                        device=device, requires_grad=True)
     optimizer = torch.optim.Adam([actions], lr=lr)
 
-    obs_0 = {"visual": start_img_t}  # (1, 1, C, H, W)
+    obs_0 = {"visual": start_img_t, "proprio": start_proprio}  # (1, 1, C, H, W)
+
+    act_mean = preprocessor.action_mean.to(device).repeat(frameskip)  # (10,)
+    act_std  = preprocessor.action_std.to(device).repeat(frameskip)   # (10,)
+    # print(f"action_mean shape: {act_mean.shape}")
+    # print(f"action std shape: {act_std.shape}")
 
     for step in range(n_optim_steps):
         optimizer.zero_grad()
 
         # normalise actions before passing to WM
-        acts_norm = preprocessor.normalize_actions(actions)
+        # acts_norm = preprocessor.normalize_actions(actions)
+        acts_norm = (actions - act_mean) / (act_std + 1e-8)
 
         # rollout: returns z_obses dict and z
         z_obses, _ = wm.rollout(obs_0, acts_norm)
@@ -396,7 +472,8 @@ def optimise_rollout(
 
     # Extract final trajectory
     with torch.no_grad():
-        acts_norm = preprocessor.normalize_actions(actions)
+        # acts_norm = preprocessor.normalize_actions(actions)
+        acts_norm = (actions - act_mean) / (act_std + 1e-8)
         z_obses, _ = wm.rollout(obs_0, acts_norm)
         z_traj = z_obses["visual"]
         if z_traj.ndim == 4:
@@ -487,22 +564,14 @@ def plot_all(rrt_path, pred_path, x_start, x_goal, sdf, device, out_dir, pca_dim
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     args   = get_args()
     device = get_device(args.cpu)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ── Setup paths ───────────────────────────────────────────────────────
     setup_ts_paths(args.ts_repo, args.model_path)
 
-    # ── Load TS world model ───────────────────────────────────────────────
-    print("Loading TS world model...")
-    wm, train_cfg = load_ts_model(args.model_path, args.model_epoch, device)
-    preprocessor, dset = load_preprocessor(args.model_path, train_cfg, device)
-    action_dim = dset.action_dim
-
-    # ── Load SDF + PCA pipeline ───────────────────────────────────────────
+    # ── Load SDF ──────────────────────────────────────────────────────────
     print("Loading SDF...")
     sdf = load_sdf_model(args.sdf_model, device)
     sdf.eval()
@@ -512,33 +581,52 @@ if __name__ == "__main__":
     scaler = pca_data["scaler"]
     ipca   = pca_data["ipca"]
     no_pca = pca_data.get("no_pca", False)
-    pca_dim = (wm.encoder.emb_dim if no_pca
-               else ipca.n_components_)
 
-    # ── Encode start and goal ─────────────────────────────────────────────
-    print("Encoding start and goal...")
-    if args.npz:
-        start_np, goal_np, start_state_gt, goal_state_gt = load_start_goal_from_npz(args.npz, args.img_size)
-        start_img_t = np_to_img_tensor(start_np, device)
-        goal_img_t  = np_to_img_tensor(goal_np,  device)
-    elif args.start_img and args.goal_img:
-        start_img_t = load_img_tensor(args.start_img, args.img_size,
-                                    preprocessor.transform, device)
-        goal_img_t  = load_img_tensor(args.goal_img,  args.img_size,
-                                    preprocessor.transform, device)
+    # ── Load episode data ─────────────────────────────────────────────────
+    if not args.wall_obses_dir:
+        raise ValueError("Provide --wall-obses-dir and --wall-states-path")
+
+    start_img_t, goal_img_t, start_state, goal_state, ep_states = \
+        load_wall_episode(
+            obses_dir   = args.wall_obses_dir,
+            states_path = args.wall_states_path,
+            episode_idx = args.wall_episode_idx,
+            img_size    = args.img_size,
+            device      = device,
+        )
+
+    # ── Encode start/goal ─────────────────────────────────────────────────
+    if args.encoder == "gt-state":
+        wm      = None
+        no_pca  = True
+        pca_dim = 2
+        scaler  = None
+        ipca    = None
+        x_start = start_state.copy()   # (2,)
+        x_goal  = goal_state.copy()    # (2,)
+
     else:
-        raise ValueError("Provide either --npz or both --start-img and --goal-img")
+        print("Loading TS world model...")
+        wm, train_cfg = load_ts_model(args.model_path, args.model_epoch, device)
+        preprocessor, dset = load_preprocessor(args.model_path, train_cfg, device)
+        action_dim = dset.action_dim * train_cfg.frameskip
+        print(f"action_dim={dset.action_dim}, frameskip={train_cfg.frameskip}, total={action_dim}")
+        pca_dim    = wm.encoder.emb_dim if no_pca else ipca.n_components_
 
-    z_start = img_to_latent(wm, start_img_t, start_state_gt)   # (1, emb_dim)
-    z_goal  = img_to_latent(wm, goal_img_t, goal_state_gt)    # (1, emb_dim)
+        # proprio must be (B, T, D) for the encoder
+        def make_proprio(state_np):
+            return torch.from_numpy(state_np).float() \
+                        .unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 2)
 
-    x_start = to_pca(z_start.cpu().numpy(), scaler, ipca, no_pca).squeeze(0)
-    x_goal  = to_pca(z_goal.cpu().numpy(),  scaler, ipca, no_pca).squeeze(0)
+        z_start = img_to_latent(wm, start_img_t, make_proprio(start_state))
+        z_goal  = img_to_latent(wm, goal_img_t,  make_proprio(goal_state))
+        x_start = to_pca(z_start.cpu().numpy(), scaler, ipca, no_pca).squeeze(0)
+        x_goal  = to_pca(z_goal.cpu().numpy(),  scaler, ipca, no_pca).squeeze(0)
 
     print(f"Start SDF: {from_pca_sdf(x_start[None], sdf, device)[0]:.4f}")
     print(f"Goal  SDF: {from_pca_sdf(x_goal[None],  sdf, device)[0]:.4f}")
 
-    # ── RRT bounds from training data ─────────────────────────────────────
+    # ── RRT bounds ────────────────────────────────────────────────────────
     X_all  = np.vstack([
         np.load(os.path.join(args.run_dir, "X_train_in.npy"),  mmap_mode="r"),
         np.load(os.path.join(args.run_dir, "X_train_out.npy"), mmap_mode="r"),
@@ -550,47 +638,53 @@ if __name__ == "__main__":
     print(f"\nRunning RRT (iters={args.rrt_iters}, step={args.rrt_step})...")
     rrt_path, _ = rrt(
         x_start, x_goal, sdf, device, bounds,
-        n_iters=args.rrt_iters,
-        step_size=args.rrt_step,
-        goal_radius=args.goal_radius,
-        margin=args.sdf_margin,
+        n_iters     = args.rrt_iters,
+        step_size   = args.rrt_step,
+        goal_radius = args.goal_radius,
+        margin      = args.sdf_margin,
     )
     rrt_sdf = from_pca_sdf(np.stack(rrt_path), sdf, device)
     print(f"RRT path: {len(rrt_path)} waypoints  "
           f"SDF min={rrt_sdf.min():.4f}  mean={rrt_sdf.mean():.4f}")
 
     # ── WM rollout ────────────────────────────────────────────────────────
-    print(f"\nOptimising WM rollout ({args.rollout_steps} steps)...")
-    rollout_pca, action_seq = optimise_rollout(
-        wm            = wm,
-        start_img_t   = start_img_t,
-        goal_latent   = z_goal,
-        sdf           = sdf,
-        scaler        = scaler,
-        ipca          = ipca,
-        no_pca        = no_pca,
-        device        = device,
-        rollout_steps = args.rollout_steps,
-        action_dim    = action_dim,
-        frameskip     = args.frameskip,
-        n_optim_steps = args.optim_steps,
-        lr            = args.optim_lr,
-        safety_weight = args.safety_weight,
-        preprocessor  = preprocessor,
-    )
-    pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
-    print(f"WM path: {len(rollout_pca)} steps  "
-          f"SDF min={pred_sdf.min():.4f}  mean={pred_sdf.mean():.4f}")
+    action_seq = None
+    if args.encoder == "gt-state":
+        print("\nSkipping WM rollout (gt-state encoder — no world model).")
+        rollout_pca = [x_start, x_goal]
+    else:
+        print(f"\nOptimising WM rollout ({args.rollout_steps} steps)...")
+        rollout_pca, action_seq = optimise_rollout(
+            wm            = wm,
+            start_img_t   = start_img_t,
+            start_proprio  = make_proprio(start_state),
+            goal_latent   = z_goal,
+            sdf           = sdf,
+            scaler        = scaler,
+            ipca          = ipca,
+            no_pca        = no_pca,
+            device        = device,
+            rollout_steps = args.rollout_steps,
+            action_dim    = action_dim,
+            frameskip     = train_cfg.frameskip,
+            n_optim_steps = args.optim_steps,
+            lr            = args.optim_lr,
+            safety_weight = args.safety_weight,
+            preprocessor  = preprocessor,
+        )
 
-    # Goal distances
-    print(f"\nGoal distance (PCA space):")
-    print(f"  RRT end:    {np.linalg.norm(rrt_path[-1]    - x_goal):.4f}")
-    print(f"  WM end:     {np.linalg.norm(rollout_pca[-1] - x_goal):.4f}")
+    pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
+    print(f"Path: {len(rollout_pca)} steps  "
+          f"SDF min={pred_sdf.min():.4f}  mean={pred_sdf.mean():.4f}")
+    print(f"\nGoal distance (latent space):")
+    print(f"  RRT end: {np.linalg.norm(rrt_path[-1]    - x_goal):.4f}")
+    print(f"  WM end:  {np.linalg.norm(rollout_pca[-1] - x_goal):.4f}")
 
     # ── Save + plot ───────────────────────────────────────────────────────
     np.save(os.path.join(args.out_dir, "rrt_path.npy"),       np.stack(rrt_path))
     np.save(os.path.join(args.out_dir, "predictor_path.npy"), np.stack(rollout_pca))
-    np.save(os.path.join(args.out_dir, "action_seq.npy"),     action_seq)
+    if action_seq is not None:
+        np.save(os.path.join(args.out_dir, "action_seq.npy"), action_seq)
 
     plot_all(rrt_path, rollout_pca, x_start, x_goal,
              sdf, device, args.out_dir, pca_dim)

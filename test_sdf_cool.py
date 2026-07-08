@@ -188,67 +188,6 @@ if __name__ == "__main__":
     sdf = load_model(args.model, device)
     sdf.eval()
 
-    # # ── Encode test episodes on-the-fly ───────────────────────────────────
-    # if args.dataset_mode == "npz":
-    #     files         = sorted(glob.glob(os.path.join(args.dataset, "*.npz")))
-    #     num_train     = int(len(files) * 0.7)
-    #     dataset_source = files[num_train:]
-    #     print(f"Evaluating on {len(dataset_source)} npz test episodes...")
-    # else:
-    #     dataset_source = load_ts_dataset(args)
-    #     print(f"Evaluating on {len(dataset_source)} TS episodes...")
- 
-    # # ── Single evaluation loop ────────────────────────────────────────────
-    # preds_all  = []
-    # labels_all = []
- 
-    # for i in range(len(dataset_source)):
-    #     if i % 100 == 0:
-    #         print(f"  Episode {i}/{len(dataset_source)}")
- 
-    #     if args.dataset_mode == "npz":
-    #         file      = np.load(dataset_source[i], allow_pickle=True)
-    #         imgs_np   = file["image"]
-    #         d         = np.where(file["dones"] == 0, 1, -1)
-    #         states_np = file[args.state_key] if args.state_key in file else None
-    #     elif args.dataset_mode == "wall":
-    #         sample    = dataset_source[i]
-    #         imgs_np   = sample["image"]
-    #         d         = np.where(sample["dones"] == 0, 1, -1)
-    #         states_np = dataset_source.states[i]
-    #     else:
-    #         sample    = dataset_source[i]
-    #         imgs_np   = sample["image"]
-    #         if torch.is_tensor(imgs_np):
-    #             imgs_np = imgs_np.cpu().numpy()
-    #         d         = np.where(sample["dones"] == 0, 1, -1)
-    #         states_np = None
-
-    #     if args.encoder == "gt-state":
-    #         enc_np = np.array(states_np, dtype=np.float32).reshape(len(states_np), -1)
-    #     elif ipca is None:
-    #         enc_np = encoder.encode(imgs_np, device)
-    #     else:
-    #         enc_np = ipca.transform(scaler.transform(encoder.encode(imgs_np, device)))
- 
-    #     enc_t = torch.from_numpy(enc_np.astype("float32")).to(device)
- 
-    #     with torch.no_grad():
-    #         preds = sdf(enc_t).squeeze(-1).cpu()
- 
-    #     preds_all.append(preds)
-    #     labels_all.append(torch.from_numpy(d.astype("float32")))
- 
-    # preds  = torch.cat(preds_all)
-    # labels = torch.cat(labels_all)
-
-    # np.save(os.path.join(args.run_dir, "test_preds.npy"),  preds)
-    # np.save(os.path.join(args.run_dir, "test_labels.npy"), labels)
-    # print(f"Saved preds and labels to {args.run_dir}")
-
-    # print(f"\n── Results: {args.encoder} | {args.run_dir} ──")
-    # evaluate(preds, labels)
-    
     # ── Load saved test set from train output ─────────────────────────────
     X_test = np.load(os.path.join(args.run_dir, "X_test.npy"), mmap_mode="r")
     y_test = np.load(os.path.join(args.run_dir, "y_test.npy"), mmap_mode="r")
@@ -262,7 +201,7 @@ if __name__ == "__main__":
     for start in range(0, len(enc_t), args.test_batch_size):
         batch = enc_t[start : start + args.test_batch_size].to(device)
         with torch.no_grad():
-            preds_list.append(sdf(batch).squeeze(-1).cpu())
+            preds_list.append(-sdf(batch).squeeze(-1).cpu())
     preds = torch.cat(preds_list)
 
     # ── Save for visualize_test.py ────────────────────────────────────────
