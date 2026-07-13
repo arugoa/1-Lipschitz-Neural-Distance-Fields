@@ -105,23 +105,26 @@ from sklearn.neighbors import KDTree
 
 
 def plot_rrt_in_state_space(
-    rrt_latents,
+    trajectories,
     run_dir,
     out_dir,
     save_path=None,
+    filename="state_space.png",
     k=5,
     show_dataset=True,
     show_numbers=False,
-    wm=False
+    labels=None,
 ):
     """
-    Visualize a latent-space trajectory in ground-truth state coordinates
-    using nearest-neighbor lookup.
+    Visualize one or more latent-space trajectories in ground-truth state
+    coordinates using nearest-neighbor lookup, all overlaid on one plot.
 
     Parameters
     ----------
-    rrt_latents : (N,D) ndarray
-        Latent trajectory from RRT or optimization.
+    trajectories : (N,D) ndarray, or list of such
+        A single latent trajectory, or a list of trajectories to compare on
+        the same axes (e.g. an RRT/WM path against that same path replayed
+        through the world model with a recovered action sequence).
 
     run_dir : str
         Directory containing
@@ -131,7 +134,10 @@ def plot_rrt_in_state_space(
             State_out.npy
 
     save_path : str or None
-        Defaults to run_dir/rrt_state_space.png
+        Defaults to out_dir/filename
+
+    filename : str
+        Used to build save_path when save_path is not given.
 
     k : int
         Number of nearest neighbors used for interpolation.
@@ -143,7 +149,24 @@ def plot_rrt_in_state_space(
 
     show_numbers : bool
         Draw waypoint indices.
+
+    labels : list of str, optional
+        Legend label per trajectory. Defaults to "trajectory 0", "trajectory 1", ...
+
+    Returns
+    -------
+    A single (N,2) ndarray if `trajectories` was a single trajectory,
+    otherwise a list of (N_i,2) ndarrays, one per input trajectory.
     """
+
+    single = isinstance(trajectories, np.ndarray) or (
+        len(trajectories) > 0 and np.ndim(trajectories[0]) == 1
+    )
+    traj_list = [trajectories] if single else list(trajectories)
+    traj_list = [np.asarray(t) for t in traj_list]
+
+    if labels is None:
+        labels = [f"trajectory {i}" for i in range(len(traj_list))]
 
     # --------------------------------------------------
     # load dataset
@@ -158,24 +181,7 @@ def plot_rrt_in_state_space(
     X = np.vstack([X_safe, X_bad])
     S = np.vstack([S_safe, S_bad])
 
-    # --------------------------------------------------
-    # nearest-neighbor lookup
-    # --------------------------------------------------
-
     tree = KDTree(X)
-
-    dist, ind = tree.query(rrt_latents, k=k)
-
-    print("Mean NN distance:", dist.mean())
-    print("Max NN distance :", dist.max())
-
-    if k == 1:
-        traj = S[ind[:, 0]]
-    else:
-        weights = 1.0 / (dist + 1e-8)
-        weights /= weights.sum(axis=1, keepdims=True)
-
-        traj = (weights[:, :, None] * S[ind]).sum(axis=1)
 
     # --------------------------------------------------
     # plotting
@@ -185,90 +191,71 @@ def plot_rrt_in_state_space(
 
     if show_dataset:
         plt.scatter(
-            S_safe[:, 0],
-            S_safe[:, 1],
-            s=2,
-            alpha=0.15,
-            color="tab:blue",
-            label="safe states",
+            S_safe[:, 0], S_safe[:, 1],
+            s=2, alpha=0.15, color="tab:blue", label="safe states",
         )
-
         plt.scatter(
-            S_bad[:, 0],
-            S_bad[:, 1],
-            s=4,
-            alpha=0.25,
-            color="tab:red",
-            label="unsafe states",
+            S_bad[:, 0], S_bad[:, 1],
+            s=4, alpha=0.25, color="tab:red", label="unsafe states",
         )
 
-    # trajectory
-    plt.plot(
-        traj[:, 0],
-        traj[:, 1],
-        "-k",
-        linewidth=2,
-        label="planned trajectory",
-        zorder=10,
-    )
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    traj_states_list = []
 
-    # color by timestep
-    plt.scatter(
-        traj[:, 0],
-        traj[:, 1],
-        c=np.arange(len(traj)),
-        cmap="viridis",
-        s=60,
-        edgecolors="k",
-        linewidths=0.5,
-        zorder=20,
-    )
+    for i, latents in enumerate(traj_list):
+        # --------------------------------------------------
+        # nearest-neighbor lookup
+        # --------------------------------------------------
+        dist, ind = tree.query(latents, k=k)
+        print(f"[{labels[i]}] Mean NN distance: {dist.mean():.4f}  "
+              f"Max NN distance: {dist.max():.4f}")
 
-    # start / goal
-    plt.scatter(
-        traj[0, 0],
-        traj[0, 1],
-        marker="o",
-        s=180,
-        color="lime",
-        edgecolors="k",
-        label="start",
-        zorder=30,
-    )
+        if k == 1:
+            traj = S[ind[:, 0]]
+        else:
+            weights = 1.0 / (dist + 1e-8)
+            weights /= weights.sum(axis=1, keepdims=True)
+            traj = (weights[:, :, None] * S[ind]).sum(axis=1)
 
-    plt.scatter(
-        traj[-1, 0],
-        traj[-1, 1],
-        marker="*",
-        s=250,
-        color="gold",
-        edgecolors="k",
-        label="goal",
-        zorder=30,
-    )
+        traj_states_list.append(traj)
+        color = colors[i % len(colors)]
 
-    if show_numbers:
-        for i, p in enumerate(traj):
-            plt.text(p[0], p[1], str(i), fontsize=8)
+        plt.plot(
+            traj[:, 0], traj[:, 1], "-",
+            linewidth=2, color=color, label=labels[i], zorder=10,
+        )
+        plt.scatter(
+            traj[:, 0], traj[:, 1],
+            s=40, color=color, edgecolors="k", linewidths=0.4, zorder=20,
+        )
+        plt.scatter(
+            traj[0, 0], traj[0, 1],
+            marker="o", s=180, color=color, edgecolors="k", zorder=30,
+        )
+        plt.scatter(
+            traj[-1, 0], traj[-1, 1],
+            marker="*", s=250, color=color, edgecolors="k", zorder=30,
+        )
+
+        if show_numbers:
+            for j, p in enumerate(traj):
+                plt.text(p[0], p[1], str(j), fontsize=8)
 
     plt.axis("equal")
     plt.xlabel("x")
     plt.ylabel("y")
-    plt.title("Planner trajectory projected to state space")
+    plt.title("Planner trajectories projected to state space")
     plt.legend()
 
     if save_path is None:
-        if not wm:
-            save_path = os.path.join(out_dir, "rrt_state_space.png")
-        else:
-            save_path = os.path.join(out_dir, "wm_state_space.png")
+        save_path = os.path.join(out_dir, filename)
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
     plt.close()
 
     print(f"Saved {save_path}")
 
-    return traj
+    return traj_states_list[0] if single else traj_states_list
 
 # ── TS model loading ───────────────────────────────────────────────────────
 
@@ -331,7 +318,7 @@ def load_wall_episode(obses_dir, states_path, episode_idx, img_size, device):
     print(f"  Episode {episode_idx}: {len(ep_states)} steps  "
           f"start={start_state}  goal={goal_state}")
 
-    return start_img_t, goal_img_t, start_state, goal_state, ep_states, imgs[:].unsqueeze(1).unsqueeze(1).to(device)
+    return start_img_t, goal_img_t, start_state, goal_state, ep_states, imgs.unsqueeze(0).to(device)  # (1, T, C, H, W)
 
 
 def load_ckpt(snapshot_path, device):
@@ -454,6 +441,32 @@ def img_to_latent(wm, img_t, state_gt):
         z = z.mean(dim=2)    # (B, T, D)
     z = z.squeeze(1)         # (B, D)
     return z                 # (1, emb_dim)
+
+
+def encode_episode_latents(wm, imgs, ep_states, preprocessor, device):
+    """
+    Encode a whole episode (all T frames at once) into per-frame mean-pooled
+    visual latents, applying the same photometric transform + proprio
+    normalisation the model saw at train time.
+
+    imgs:      (1, T, C, H, W) tensor, resized + scaled to [0,1] but not yet
+               photometrically normalised (as returned by load_wall_episode).
+    ep_states: (T, 2) numpy raw (unnormalised) states.
+
+    Returns (T, D) numpy latent trajectory.
+    """
+    imgs = preprocessor.transform(imgs)
+    proprio = preprocessor.normalize_proprios(
+        torch.from_numpy(ep_states).float()
+    ).unsqueeze(0).to(device)  # (1, T, 2)
+
+    obs = {"visual": imgs, "proprio": proprio}
+    with torch.no_grad():
+        z_dict = wm.encode_obs(obs)
+    z = z_dict["visual"]       # (1, T, patches, D) or (1, T, D)
+    if z.ndim == 4:
+        z = z.mean(dim=2)      # (1, T, D)
+    return z.squeeze(0).cpu().numpy()  # (T, D)
 
 
 def load_start_goal_from_npz(npz_path, img_size):
@@ -696,6 +709,7 @@ def recover_actions(
     device,
     n_iters=300,
     lr=1e-2,
+    max_waypoints=40,
 ):
     """
     Recover an action sequence that reproduces `latent_path` (waypoint 0 is
@@ -706,12 +720,31 @@ def recover_actions(
     latent_path waypoints may live in PCA space (they are lifted back to the
     pooled visual-latent space wm.rollout operates in before optimisation).
 
+    latent_path can be much longer than the WM's own rollout horizon (e.g. an
+    RRT path with a fine step size can have hundreds of waypoints). wm.rollout
+    unrolls one full predictor forward pass per waypoint and keeps every
+    activation for a single backward() call, so optimising against all of
+    them at once is not memory-feasible (this previously caused a CUDA OOM
+    for RRT paths). Waypoints are evenly subsampled — always keeping the
+    first and last — down to at most `max_waypoints` before optimising;
+    matching every dense RRT micro-step is not meaningful anyway since RRT's
+    step size is far finer than the WM's actual dynamics granularity.
+
     Returns
     -------
-    (len(latent_path)-1, action_dim)
+    actions      : (min(len(latent_path), max_waypoints)-1, action_dim) numpy
+    target_path  : the (possibly subsampled) latent_path actually optimised
+                   against — pass this to plot_rrt_in_state_space alongside
+                   a replay of `actions` for a fair, index-aligned comparison.
     """
 
     wm.eval()
+
+    latent_path = list(latent_path)
+    if max_waypoints is not None and len(latent_path) > max_waypoints:
+        idx = np.unique(np.linspace(0, len(latent_path) - 1, max_waypoints).round().astype(int))
+        print(f"  recover_actions: subsampling {len(latent_path)} waypoints -> {len(idx)}")
+        latent_path = [latent_path[i] for i in idx]
 
     # lift every waypoint back to the pooled visual-latent space
     targets = []
@@ -749,7 +782,39 @@ def recover_actions(
         if (step + 1) % 50 == 0:
             print(f"  recover_actions {step+1}/{n_iters}  loss={loss.item():.6f}")
 
-    return actions.detach().cpu().numpy().squeeze(0)  # (n_steps, action_dim)
+    return actions.detach().cpu().numpy().squeeze(0), latent_path  # (n_steps, action_dim)
+
+
+def replay_actions(
+    wm, start_img_t, start_proprio, actions_np,
+    frameskip, preprocessor, scaler, ipca, no_pca, device,
+):
+    """
+    Roll the world model forward (no grad) with a fixed action sequence and
+    return the resulting trajectory projected into the same (PCA) space as
+    rrt_path / rollout_pca — used to sanity-check that a recovered/optimised
+    action sequence actually reproduces the states it was derived from, by
+    plotting it alongside the original path.
+
+    actions_np: (T, action_dim) numpy, raw (unnormalised) actions.
+    Returns a list of T+1 (pca_dim,) arrays.
+    """
+    wm.eval()
+    actions = torch.tensor(actions_np, dtype=torch.float32, device=device).unsqueeze(0)  # (1,T,action_dim)
+    act_mean = preprocessor.action_mean.to(device).repeat(frameskip)
+    act_std  = preprocessor.action_std.to(device).repeat(frameskip)
+
+    obs_0 = {"visual": start_img_t, "proprio": start_proprio}
+    with torch.no_grad():
+        acts_norm = (actions - act_mean) / (act_std + 1e-8)
+        z_obses, _ = wm.rollout(obs_0, acts_norm)
+        z_traj = z_obses["visual"]
+        if z_traj.ndim == 4:
+            z_traj = z_traj.mean(dim=2)
+        z_traj = z_traj.squeeze(0).cpu().numpy()  # (T+1, D)
+
+    return list(to_pca(z_traj, scaler, ipca, no_pca))
+
 
 # ── Feasibility check ──────────────────────────────────────────────────────
 
@@ -896,21 +961,15 @@ if __name__ == "__main__":
         start_img_t = preprocessor.transform(start_img_t)
         goal_img_t  = preprocessor.transform(goal_img_t)
 
-        # plot_rrt_in_state_space(
-        #     to_pca(
-        #         img_to_latent(
-        #             wm, 
-        #             imgs, 
-        #             make_proprio(imgs)
-        #             ).cpu().numpy(), 
-        #         scaler, 
-        #         ipca, 
-        #         no_pca
-        #         ).squeeze(0), 
-        #     args.run_dir, 
-        #     args.out_dir, 
-        #     save_path=os.path.join(args.out_dir, "original_episode_path.png")
-        #     )
+        ep_latents = encode_episode_latents(wm, imgs, ep_states, preprocessor, device)
+        ep_pca = to_pca(ep_latents, scaler, ipca, no_pca)
+        plot_rrt_in_state_space(
+            ep_pca,
+            run_dir=args.run_dir,
+            out_dir=args.out_dir,
+            save_path=os.path.join(args.out_dir, "original_episode_path.png"),
+            labels=["original episode"],
+        )
 
         z_start = img_to_latent(wm, start_img_t, make_proprio(start_state))
         z_goal  = img_to_latent(wm, goal_img_t,  make_proprio(goal_state))
@@ -941,18 +1000,26 @@ if __name__ == "__main__":
     print(f"RRT path: {len(rrt_path)} waypoints  "
           f"SDF min={rrt_sdf.min():.4f}  mean={rrt_sdf.mean():.4f}")
     
-    traj_states = plot_rrt_in_state_space(
-        rrt_latents=rrt_path,
-        run_dir=args.run_dir,
-        out_dir=args.out_dir,
-        k=5)
-    
-    rrt_actions = recover_actions(
+    rrt_actions, rrt_target_path = recover_actions(
         wm, start_img_t, make_proprio(start_state), rrt_path,
         scaler, ipca, no_pca, action_dim, train_cfg.frameskip,
         preprocessor, device,
     )
     print("Actions to get to goal from rrt states: ", rrt_actions)
+
+    # validate: replay the recovered actions through the WM and compare
+    # against the (subsampled) targets they were optimised to reach.
+    rrt_replayed_pca = replay_actions(
+        wm, start_img_t, make_proprio(start_state), rrt_actions,
+        train_cfg.frameskip, preprocessor, scaler, ipca, no_pca, device,
+    )
+    traj_states = plot_rrt_in_state_space(
+        [rrt_path, rrt_target_path, rrt_replayed_pca],
+        run_dir=args.run_dir,
+        out_dir=args.out_dir,
+        filename="rrt_state_space.png",
+        labels=["RRT path (full)", "RRT target (subsampled)", "RRT replayed (recovered actions)"],
+        k=5)
 
     # ── WM rollout ────────────────────────────────────────────────────────
     action_seq = None
@@ -980,15 +1047,21 @@ if __name__ == "__main__":
             preprocessor  = preprocessor,
             margin        = args.sdf_margin,
         )
+        # action_seq (from optimise_rollout) already is the recovered action
+        # sequence for rollout_pca — no need to re-derive it. Replay it back
+        # through the WM as a sanity check that rollout_pca is reproducible.
+        print("Actions to get to goal from wm states: ", action_seq)
+        wm_replayed_pca = replay_actions(
+            wm, start_img_t, make_proprio(start_state), action_seq,
+            train_cfg.frameskip, preprocessor, scaler, ipca, no_pca, device,
+        )
         traj_states = plot_rrt_in_state_space(
-            rrt_latents=rollout_pca,
+            [rollout_pca, wm_replayed_pca],
             run_dir=args.run_dir,
             out_dir=args.out_dir,
-            k=5,
-            wm=True)
-        # action_seq (from optimise_rollout) already is the recovered action
-        # sequence for rollout_pca — no need to re-derive it.
-        print("Actions to get to goal from wm states: ", action_seq)
+            filename="wm_state_space.png",
+            labels=["WM optimised rollout", "WM replayed (action_seq)"],
+            k=5)
 
     pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
     print(f"Path: {len(rollout_pca)} steps  "
