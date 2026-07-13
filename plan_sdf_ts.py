@@ -114,6 +114,8 @@ def plot_rrt_in_state_space(
     show_dataset=True,
     show_numbers=False,
     labels=None,
+    gt_trajectories=None,
+    gt_labels=None,
 ):
     """
     Visualize one or more latent-space trajectories in ground-truth state
@@ -153,10 +155,21 @@ def plot_rrt_in_state_space(
     labels : list of str, optional
         Legend label per trajectory. Defaults to "trajectory 0", "trajectory 1", ...
 
+    gt_trajectories : (N,2) ndarray, or list of such, optional
+        Ground-truth trajectories already in real state-space coordinates —
+        plotted directly (no NN lookup / no encoder involved), dashed, so you
+        can visually compare the encoder+PCA+NN-lookup reconstruction in
+        `trajectories` against the true states (embedding-quality check).
+
+    gt_labels : list of str, optional
+        Legend label per ground-truth trajectory.
+
     Returns
     -------
     A single (N,2) ndarray if `trajectories` was a single trajectory,
     otherwise a list of (N_i,2) ndarrays, one per input trajectory.
+    Ground-truth trajectories are not included in the return value (they're
+    already in state space — nothing to hand back).
     """
 
     single = isinstance(trajectories, np.ndarray) or (
@@ -167,6 +180,17 @@ def plot_rrt_in_state_space(
 
     if labels is None:
         labels = [f"trajectory {i}" for i in range(len(traj_list))]
+
+    if gt_trajectories is None:
+        gt_list = []
+    else:
+        gt_single = isinstance(gt_trajectories, np.ndarray) or (
+            len(gt_trajectories) > 0 and np.ndim(gt_trajectories[0]) == 1
+        )
+        gt_list = [gt_trajectories] if gt_single else list(gt_trajectories)
+        gt_list = [np.asarray(t) for t in gt_list]
+    if gt_labels is None:
+        gt_labels = [f"ground truth {i}" for i in range(len(gt_list))]
 
     # --------------------------------------------------
     # load dataset
@@ -235,6 +259,33 @@ def plot_rrt_in_state_space(
         plt.scatter(
             traj[-1, 0], traj[-1, 1],
             marker="*", s=250, color=color, edgecolors="k", zorder=30,
+        )
+
+        if show_numbers:
+            for j, p in enumerate(traj):
+                plt.text(p[0], p[1], str(j), fontsize=8)
+
+    # ground-truth trajectories: already in state space, plotted directly
+    # (no NN lookup), dashed + distinct marker so they read as "exact" next
+    # to the encoded/projected trajectories above.
+    for i, traj in enumerate(gt_list):
+        color = colors[(len(traj_list) + i) % len(colors)]
+
+        plt.plot(
+            traj[:, 0], traj[:, 1], "--",
+            linewidth=2, color=color, label=gt_labels[i], zorder=11,
+        )
+        plt.scatter(
+            traj[:, 0], traj[:, 1],
+            marker="x", s=40, color=color, linewidths=1.2, zorder=21,
+        )
+        plt.scatter(
+            traj[0, 0], traj[0, 1],
+            marker="o", s=180, facecolors="none", edgecolors=color, linewidths=2, zorder=30,
+        )
+        plt.scatter(
+            traj[-1, 0], traj[-1, 1],
+            marker="*", s=250, facecolors="none", edgecolors=color, linewidths=2, zorder=30,
         )
 
         if show_numbers:
@@ -968,7 +1019,9 @@ if __name__ == "__main__":
             run_dir=args.run_dir,
             out_dir=args.out_dir,
             save_path=os.path.join(args.out_dir, "original_episode_path.png"),
-            labels=["original episode"],
+            labels=["original episode (encoded, projected)"],
+            gt_trajectories=[ep_states],
+            gt_labels=["original episode (ground truth)"],
         )
 
         z_start = img_to_latent(wm, start_img_t, make_proprio(start_state))
