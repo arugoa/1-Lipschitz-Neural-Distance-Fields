@@ -82,9 +82,9 @@ def get_args():
 
     # RRT
     parser.add_argument("--rrt-iters",   type=int,   default=5000)
-    parser.add_argument("--rrt-step",    type=float, default=0.5)
+    parser.add_argument("--rrt-step",    type=float, default=0.01)
     parser.add_argument("--sdf-margin",  type=float, default=0.001)
-    parser.add_argument("--goal-radius", type=float, default=0.5)
+    parser.add_argument("--goal-radius", type=float, default=0.01)
 
     # WM rollout optimisation
     parser.add_argument("--rollout-steps", type=int,   default=30)
@@ -165,6 +165,9 @@ def plot_rrt_in_state_space(
     tree = KDTree(X)
 
     dist, ind = tree.query(rrt_latents, k=k)
+
+    print("Mean NN distance:", dist.mean())
+    print("Max NN distance :", dist.max())
 
     if k == 1:
         traj = S[ind[:, 0]]
@@ -328,7 +331,7 @@ def load_wall_episode(obses_dir, states_path, episode_idx, img_size, device):
     print(f"  Episode {episode_idx}: {len(ep_states)} steps  "
           f"start={start_state}  goal={goal_state}")
 
-    return start_img_t, goal_img_t, start_state, goal_state, ep_states
+    return start_img_t, goal_img_t, start_state, goal_state, ep_states, imgs[:].unsqueeze(1).unsqueeze(1).to(device)
 
 
 def load_ckpt(snapshot_path, device):
@@ -514,7 +517,7 @@ class RRTNode:
         self.parent = parent
 
 
-def edge_safe(sdf, x_a, x_b, device, margin, n=10):
+def edge_safe(sdf, x_a, x_b, device, margin, n=50):
     pts  = np.stack([x_a + t * (x_b - x_a) for t in np.linspace(0, 1, n)])
     vals = from_pca_sdf(pts, sdf, device)
     return np.all(vals > margin)
@@ -653,6 +656,110 @@ def optimise_rollout(
     return rollout_pca, actions.detach().cpu().numpy().squeeze(0)
 
 
+# Finding actions for states planned
+
+def recover_actions(
+    wm,
+    latent_path,
+    action_dim,
+    device,
+    n_iters=200,
+    lr=5e-2,
+):
+    """
+    Recover an action between every pair of latent states.
+
+    latent_path:
+        list of latent embeddings
+        each element is either
+
+            (D,)               pooled latent
+
+        or
+
+            (patches,D)        full encoder output
+
+    Returns
+    -------
+    (N-1, action_dim)
+    """
+
+    wm.eval()
+
+    recovered_actions = []
+
+    for i in range(len(latent_path) - 1):
+
+        z0 = torch.tensor(
+            latent_path[i],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        z1 = torch.tensor(
+            latent_path[i + 1],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # ---------------------------------------------------
+        # if using pooled embeddings we cannot recover actions
+        # ---------------------------------------------------
+
+        if z0.ndim == 1:
+            print(
+                "recover_actions(): "
+                "latent path only contains pooled embeddings.\n"
+                "Returning zeros because predictor needs full token embeddings."
+            )
+
+            recovered_actions.append(
+                np.zeros(action_dim, dtype=np.float32)
+            )
+            continue
+
+        # predictor expects
+        #
+        # (B,T,P,D)
+        #
+
+        z0 = z0.unsqueeze(0).unsqueeze(0)
+
+        action = torch.zeros(
+            1,
+            1,
+            action_dim,
+            device=device,
+            requires_grad=True,
+        )
+
+        optimiser = torch.optim.Adam([action], lr=lr)
+
+        for _ in range(n_iters):
+
+            optimiser.zero_grad()
+
+            latent = wm.replace_actions_from_z(
+                z0.clone(),
+                action,
+            )
+
+            pred = wm.predict(latent)
+
+            loss = F.mse_loss(
+                pred[:, -1],
+                z1.unsqueeze(0),
+            )
+
+            loss.backward()
+            optimiser.step()
+
+        recovered_actions.append(
+            action.detach().cpu().numpy()[0, 0]
+        )
+
+    return np.stack(recovered_actions)
+
 # ── Feasibility check ──────────────────────────────────────────────────────
 
 def check_feasibility(rrt_path, pred_path):
@@ -755,7 +862,7 @@ if __name__ == "__main__":
     if not args.wall_obses_dir:
         raise ValueError("Provide --wall-obses-dir and --wall-states-path")
 
-    start_img_t, goal_img_t, start_state, goal_state, ep_states = \
+    start_img_t, goal_img_t, start_state, goal_state, ep_states, imgs = \
         load_wall_episode(
             obses_dir   = args.wall_obses_dir,
             states_path = args.wall_states_path,
@@ -786,6 +893,22 @@ if __name__ == "__main__":
         def make_proprio(state_np):
             return torch.from_numpy(state_np).float() \
                         .unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 2)
+        
+        # plot_rrt_in_state_space(
+        #     to_pca(
+        #         img_to_latent(
+        #             wm, 
+        #             imgs, 
+        #             make_proprio(imgs)
+        #             ).cpu().numpy(), 
+        #         scaler, 
+        #         ipca, 
+        #         no_pca
+        #         ).squeeze(0), 
+        #     args.run_dir, 
+        #     args.out_dir, 
+        #     save_path=os.path.join(args.out_dir, "original_episode_path.png")
+        #     )
 
         z_start = img_to_latent(wm, start_img_t, make_proprio(start_state))
         z_goal  = img_to_latent(wm, goal_img_t,  make_proprio(goal_state))
@@ -821,6 +944,9 @@ if __name__ == "__main__":
         run_dir=args.run_dir,
         out_dir=args.out_dir,
         k=5)
+    
+    rrt_actions = recover_actions(wm, rrt_path, action_dim, device)
+    print("Actions to get to goal from rrt states: ", rrt_actions)
 
     # ── WM rollout ────────────────────────────────────────────────────────
     action_seq = None
@@ -853,6 +979,8 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             k=5,
             wm=True)
+        wm_actions = recover_actions(wm, rollout_pca, action_dim, device)
+        print("Actions to get to goal from wm states: ", wm_actions)
 
     pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
     print(f"Path: {len(rollout_pca)} steps  "
