@@ -501,6 +501,28 @@ def to_pca(z_np, scaler, ipca, no_pca):
     return ipca.transform(scaler.transform(z_np))
 
 
+def to_pca_torch(z, scaler, ipca, no_pca, device):
+    """
+    Differentiable equivalent of to_pca() for a torch tensor z: (..., D).
+    Reimplements StandardScaler + IncrementalPCA.transform with torch ops so
+    gradients can flow from the SDF value back through to `z` (and hence to
+    the actions that produced it).
+    """
+    if no_pca or scaler is None:
+        return z
+    mean  = torch.as_tensor(scaler.mean_,  dtype=z.dtype, device=device)
+    scale = torch.as_tensor(scaler.scale_, dtype=z.dtype, device=device)
+    z = (z - mean) / scale
+
+    pca_mean   = torch.as_tensor(ipca.mean_,       dtype=z.dtype, device=device)
+    components = torch.as_tensor(ipca.components_, dtype=z.dtype, device=device)  # (n_comp, D)
+    z = (z - pca_mean) @ components.T
+    if getattr(ipca, "whiten", False):
+        explained_var = torch.as_tensor(ipca.explained_variance_, dtype=z.dtype, device=device)
+        z = z / torch.sqrt(explained_var)
+    return z
+
+
 def from_pca_sdf(pca_pts, sdf, device):
     """Query SDF for a batch of PCA points. Returns numpy (N,)."""
     t = torch.from_numpy(pca_pts.astype("float32")).to(device)
@@ -583,7 +605,7 @@ def optimise_rollout(
     scaler, ipca, no_pca, device,
     rollout_steps, action_dim, frameskip,
     n_optim_steps, lr, safety_weight,
-    preprocessor,
+    preprocessor, margin=0.0,
 ):
     """
     Optimise an action sequence so wm.rollout reaches goal_latent.
@@ -620,18 +642,20 @@ def optimise_rollout(
         z_traj = z_traj.squeeze(0)        # (T, D)
         z_final = z_traj[-1:]             # (1, D)
 
-        # goal loss: cosine distance in full latent space
-        goal_loss = (1.0 - F.cosine_similarity(z_final, goal_latent, dim=-1)).mean()
+        # goal loss: MSE against the goal latent, matching this codebase's
+        # validated planning objective (planning/objectives.py:objective_fn_last,
+        # used by gd.py/mpc.py) — cosine similarity is magnitude-blind and lets
+        # the optimiser "solve" the loss by pointing the right direction
+        # without actually landing on the goal embedding.
+        goal_loss = F.mse_loss(z_final, goal_latent)
 
-        # safety loss: penalise SDF < margin along trajectory
+        # safety loss: penalise SDF < margin along trajectory (differentiable
+        # w.r.t. actions, since to_pca_torch replaces the numpy sklearn calls)
         safety_loss = torch.tensor(0.0, device=device)
         if not no_pca and scaler is not None:
-            z_np  = z_traj.detach().cpu().numpy()
-            p_np  = ipca.transform(scaler.transform(z_np))
-            p_t   = torch.from_numpy(p_np).float().to(device)
-            with torch.no_grad():
-                sdf_v = sdf(p_t).squeeze(-1)
-            safety_loss = F.relu(sdf_v + 0.0).mean()
+            p_t   = to_pca_torch(z_traj, scaler, ipca, no_pca, device)
+            sdf_v = sdf(p_t).squeeze(-1)
+            safety_loss = F.relu(margin - sdf_v).mean()
 
         loss = goal_loss + safety_weight * safety_loss
         loss.backward()
@@ -660,105 +684,72 @@ def optimise_rollout(
 
 def recover_actions(
     wm,
+    start_img_t,
+    start_proprio,
     latent_path,
+    scaler,
+    ipca,
+    no_pca,
     action_dim,
+    frameskip,
+    preprocessor,
     device,
-    n_iters=200,
-    lr=5e-2,
+    n_iters=300,
+    lr=1e-2,
 ):
     """
-    Recover an action between every pair of latent states.
+    Recover an action sequence that reproduces `latent_path` (waypoint 0 is
+    the start state) by rolling the world model forward from
+    (start_img_t, start_proprio) and gradient-descending on the actions so
+    the rollout matches every waypoint.
 
-    latent_path:
-        list of latent embeddings
-        each element is either
-
-            (D,)               pooled latent
-
-        or
-
-            (patches,D)        full encoder output
+    latent_path waypoints may live in PCA space (they are lifted back to the
+    pooled visual-latent space wm.rollout operates in before optimisation).
 
     Returns
     -------
-    (N-1, action_dim)
+    (len(latent_path)-1, action_dim)
     """
 
     wm.eval()
 
-    recovered_actions = []
+    # lift every waypoint back to the pooled visual-latent space
+    targets = []
+    for p in latent_path:
+        p = np.asarray(p, dtype="float32").reshape(1, -1)
+        if no_pca or scaler is None:
+            full = p
+        else:
+            full = scaler.inverse_transform(ipca.inverse_transform(p))
+        targets.append(full.reshape(-1))
+    targets = torch.tensor(np.stack(targets), dtype=torch.float32, device=device)  # (N, D)
 
-    for i in range(len(latent_path) - 1):
+    n_steps = targets.shape[0] - 1
+    actions = torch.zeros(1, n_steps, action_dim, device=device, requires_grad=True)
+    optimiser = torch.optim.Adam([actions], lr=lr)
 
-        z0 = torch.tensor(
-            latent_path[i],
-            dtype=torch.float32,
-            device=device,
-        )
+    obs_0 = {"visual": start_img_t, "proprio": start_proprio}
+    act_mean = preprocessor.action_mean.to(device).repeat(frameskip)
+    act_std  = preprocessor.action_std.to(device).repeat(frameskip)
 
-        z1 = torch.tensor(
-            latent_path[i + 1],
-            dtype=torch.float32,
-            device=device,
-        )
+    for step in range(n_iters):
+        optimiser.zero_grad()
 
-        # ---------------------------------------------------
-        # if using pooled embeddings we cannot recover actions
-        # ---------------------------------------------------
+        acts_norm = (actions - act_mean) / (act_std + 1e-8)
+        z_obses, _ = wm.rollout(obs_0, acts_norm)
+        z_traj = z_obses["visual"]
+        if z_traj.ndim == 4:
+            z_traj = z_traj.mean(dim=2)
+        z_traj = z_traj.squeeze(0)  # (n_steps+1, D)
 
-        if z0.ndim == 1:
-            print(
-                "recover_actions(): "
-                "latent path only contains pooled embeddings.\n"
-                "Returning zeros because predictor needs full token embeddings."
-            )
+        loss = F.mse_loss(z_traj, targets)
+        loss.backward()
+        optimiser.step()
 
-            recovered_actions.append(
-                np.zeros(action_dim, dtype=np.float32)
-            )
-            continue
+        if (step + 1) % 50 == 0:
+            print(f"  recover_actions {step+1}/{n_iters}  loss={loss.item():.6f}")
 
-        # predictor expects
-        #
-        # (B,T,P,D)
-        #
-
-        z0 = z0.unsqueeze(0).unsqueeze(0)
-
-        action = torch.zeros(
-            1,
-            1,
-            action_dim,
-            device=device,
-            requires_grad=True,
-        )
-
-        optimiser = torch.optim.Adam([action], lr=lr)
-
-        for _ in range(n_iters):
-
-            optimiser.zero_grad()
-
-            latent = wm.replace_actions_from_z(
-                z0.clone(),
-                action,
-            )
-
-            pred = wm.predict(latent)
-
-            loss = F.mse_loss(
-                pred[:, -1],
-                z1.unsqueeze(0),
-            )
-
-            loss.backward()
-            optimiser.step()
-
-        recovered_actions.append(
-            action.detach().cpu().numpy()[0, 0]
-        )
-
-    return np.stack(recovered_actions)
+    return actions.detach().cpu().numpy().squeeze(0)  # (n_steps, action_dim)
 
 # ── Feasibility check ──────────────────────────────────────────────────────
 
@@ -889,11 +880,22 @@ if __name__ == "__main__":
         print(f"action_dim={dset.action_dim}, frameskip={train_cfg.frameskip}, total={action_dim}")
         pca_dim    = wm.encoder.emb_dim if no_pca else ipca.n_components_
 
-        # proprio must be (B, T, D) for the encoder
+        # proprio must be (B, T, D) for the encoder, normalised the same way
+        # the dataset normalises it before training (raw world coords in,
+        # (x - proprio_mean) / proprio_std out) — the encoder never saw raw
+        # coordinates at train time.
         def make_proprio(state_np):
-            return torch.from_numpy(state_np).float() \
-                        .unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 2)
-        
+            raw = torch.from_numpy(state_np).float().unsqueeze(0).unsqueeze(0)  # (1, 1, 2)
+            return preprocessor.normalize_proprios(raw).to(device)
+
+        # start/goal images are only resized + scaled to [0, 1] so far; the
+        # encoder (DinoV2Encoder.forward) applies no normalisation of its own,
+        # so we still need the dataset's photometric transform
+        # (Resize/CenterCrop/Normalize(0.5,0.5,0.5)) that training images went
+        # through, otherwise the encoder sees out-of-distribution inputs.
+        start_img_t = preprocessor.transform(start_img_t)
+        goal_img_t  = preprocessor.transform(goal_img_t)
+
         # plot_rrt_in_state_space(
         #     to_pca(
         #         img_to_latent(
@@ -945,7 +947,11 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         k=5)
     
-    rrt_actions = recover_actions(wm, rrt_path, action_dim, device)
+    rrt_actions = recover_actions(
+        wm, start_img_t, make_proprio(start_state), rrt_path,
+        scaler, ipca, no_pca, action_dim, train_cfg.frameskip,
+        preprocessor, device,
+    )
     print("Actions to get to goal from rrt states: ", rrt_actions)
 
     # ── WM rollout ────────────────────────────────────────────────────────
@@ -972,6 +978,7 @@ if __name__ == "__main__":
             lr            = args.optim_lr,
             safety_weight = args.safety_weight,
             preprocessor  = preprocessor,
+            margin        = args.sdf_margin,
         )
         traj_states = plot_rrt_in_state_space(
             rrt_latents=rollout_pca,
@@ -979,8 +986,9 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             k=5,
             wm=True)
-        wm_actions = recover_actions(wm, rollout_pca, action_dim, device)
-        print("Actions to get to goal from wm states: ", wm_actions)
+        # action_seq (from optimise_rollout) already is the recovered action
+        # sequence for rollout_pca — no need to re-derive it.
+        print("Actions to get to goal from wm states: ", action_seq)
 
     pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
     print(f"Path: {len(rollout_pca)} steps  "
