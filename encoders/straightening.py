@@ -1,12 +1,16 @@
 """
 Temporal Straightening encoder wrapper (DinoV2Encoder backend).
 
-Encoder forward: (B, C, H, W) -> (B, num_patches, emb_dim) or (B, 1, emb_dim)
-We mean-pool the patch dim to get (B, emb_dim), then process T frames -> (T, emb_dim).
+Uses encoder.forward(x, return_agg=True), which runs the trained agg_mlp
+head (the same aggregation the "aggcos" curvature loss shaped at train
+time) to collapse the patch grid: (B, C, H, W) -> (B, agg_out_dim). Input
+is resized to match the patch grid agg_mlp was actually trained on (see
+self.encoder_image_size in __init__) before encoding.
 """
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torchvision.transforms import v2 as transforms
 from .base import BaseEncoder
 
@@ -41,13 +45,23 @@ class TSEncoder(BaseEncoder):
             transforms.Resize(size=img_size),
         ])
 
-        # Probe output dim
-        dummy = torch.zeros(1, 3, img_size, img_size).cuda()
+        # VWorldModel resizes visual input to a size whose patch grid matches
+        # what encoder.agg_mlp was actually built (and trained, via the
+        # "aggcos" curvature loss) for: (image_size // 16) * patch_size —
+        # see models/visual_world_model.py's `self.encoder_transform`. Must
+        # replicate that resize here, or agg_mlp's fixed input layer won't
+        # match the patch count from a raw img_size input.
+        decoder_scale = 16
+        num_side_patches = img_size // decoder_scale
+        self.encoder_image_size = num_side_patches * self.encoder.patch_size
+
+        # Probe output dim (use the trained aggregation head, not a naive mean-pool)
+        dummy = torch.zeros(1, 3, self.encoder_image_size, self.encoder_image_size).cuda()
         with torch.no_grad():
-            out = self.encoder(dummy)    # (1, num_patches, D) or (1, 1, D)
-        # mean-pool patch dim → (1, D)
-        self._output_dim = out.mean(dim=1).shape[-1]
-        print(f"StraighteningEncoder: raw output {out.shape} → pooled dim {self._output_dim}")
+            out = self.encoder(dummy, return_agg=True)    # (1, agg_out_dim)
+        self._output_dim = out.shape[-1]
+        print(f"StraighteningEncoder: aggregated output {out.shape} → dim {self._output_dim} "
+              f"(encoder input resized to {self.encoder_image_size}x{self.encoder_image_size})")
 
     def output_dim(self) -> int:
         return self._output_dim
@@ -72,9 +86,16 @@ class TSEncoder(BaseEncoder):
             frames = [self.transform(imgs_np[t]) for t in range(len(imgs_np))]
             imgs_t = torch.stack(frames).to(device)
 
+        # match encoder.agg_mlp's expected patch grid (see __init__)
+        if imgs_t.shape[-1] != self.encoder_image_size:
+            imgs_t = F.interpolate(
+                imgs_t, size=(self.encoder_image_size, self.encoder_image_size),
+                mode="bilinear", align_corners=False,
+            )
+
         with torch.no_grad():
-            out = self.encoder(imgs_t)
-            enc = out.mean(dim=1)
+            out = self.encoder(imgs_t, return_agg=True)
+            enc = out
 
         result = enc.cpu().float().numpy()
         del imgs_t, out, enc
