@@ -9,7 +9,7 @@ Sanity-check the TS encoder's latent space by round-tripping a single state:
    from --run-dir) and look up their ground-truth positions.
 4. "Decode" the embedding back to a position estimate — there is no trained
    latent-to-position network in this codebase, so this uses the same
-   distance-weighted k-NN average that plan_sdf_ts.py's
+   distance-weighted k-NN average that plan_sdf.py's
    plot_rrt_in_state_space() already uses as its de facto decoder.
 5. Plot the original (ground truth) position, the k nearest-neighbor
    positions, and the decoded estimate together, so encoder quality is
@@ -122,7 +122,7 @@ def main():
             f"Embedding dim mismatch: X_train has D={X_train.shape[1]} but the "
             f"live-encoded query has D={z_query.shape[1]}. X_train_in/out.npy in "
             f"--run-dir were probably generated before the return_agg fix — "
-            f"rerun train_lip_cool.py's data-prep step to regenerate them."
+            f"rerun train_sdf.py's data-prep step to regenerate them."
         )
 
     # ── k nearest neighbors ─────────────────────────────────────────────────
@@ -136,7 +136,7 @@ def main():
 
     # ── "decode": distance-weighted average of the k neighbors' positions ──
     # (No trained latent->position network exists in this codebase; this
-    # matches the k-NN convention plan_sdf_ts.py's plot_rrt_in_state_space
+    # matches the k-NN convention plan_sdf.py's plot_rrt_in_state_space
     # already uses to turn a latent into a state-space estimate.)
     weights = 1.0 / (dist + 1e-8)
     weights /= weights.sum()

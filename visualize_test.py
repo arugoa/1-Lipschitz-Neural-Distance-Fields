@@ -334,7 +334,7 @@ if __name__ == "__main__":
     # Load data
     preds_path  = os.path.join(run, "test_preds.npy")
     labels_path = os.path.join(run, "test_labels.npy")
-    assert os.path.exists(preds_path), "Run test_sdf_cool.py first to generate test_preds.npy"
+    assert os.path.exists(preds_path), "Run test_sdf.py first to generate test_preds.npy"
     preds  = np.load(preds_path)
     labels = np.load(labels_path)
 

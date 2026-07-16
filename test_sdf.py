@@ -155,7 +155,7 @@ if __name__ == "__main__":
         dataset_source = files[num_train:]
         print(f"Evaluating on {len(dataset_source)} npz test episodes...")
     elif args.dataset_mode == "wall":
-        from train_lip_cool import (WallDatasetSource, load_wall_config,
+        from train_sdf import (WallDatasetSource, load_wall_config,
                                     compute_dones_from_geometry, is_near_wall,
                                     check_wall_intersect)
         cfg = load_wall_config(args.wall_config)

@@ -2,10 +2,10 @@
 Unified SDF training script.
 
 Usage examples:
-    python train_lip_cool.py ../dataset-good/ --encoder cjepa --pca-dims 3
-    python train_lip_cool.py ../dataset-good/ --encoder dreamer --pca-dims 5 --dreamer-ckpt path/to/ckpt
-    python train_lip_cool.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt
-    python train_lip_cool.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt --no-pca
+    python train_sdf.py ../dataset-good/ --encoder cjepa --pca-dims 3
+    python train_sdf.py ../dataset-good/ --encoder dreamer --pca-dims 5 --dreamer-ckpt path/to/ckpt
+    python train_sdf.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt
+    python train_sdf.py ../dataset-good/ --encoder autoencoder --autoencoder-ckpt path/to/ckpt --no-pca
 """
 
 import os
