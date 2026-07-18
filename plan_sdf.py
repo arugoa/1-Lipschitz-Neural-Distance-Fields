@@ -843,35 +843,59 @@ def recover_actions(
     return actions.detach().cpu().numpy().squeeze(0), latent_path  # (n_steps, action_dim)
 
 
-def replay_actions(
-    wm, start_img_t, start_proprio, actions_np,
-    frameskip, preprocessor, scaler, ipca, no_pca, device,
-):
+def build_wall_env(states_path, episode_idx, device="cpu"):
     """
-    Roll the world model forward (no grad) with a fixed action sequence and
-    return the resulting trajectory projected into the same (PCA) space as
-    rrt_path / rollout_pca — used to sanity-check that a recovered/optimised
-    action sequence actually reproduces the states it was derived from, by
-    plotting it alongside the original path.
-
-    actions_np: (T, action_dim) numpy, raw (unnormalised) actions.
-    Returns a list of T+1 (pca_dim,) arrays.
+    Construct a WallEnvWrapper configured with episode_idx's *actual*
+    door/wall layout (door_locations.pth / wall_locations.pth, siblings of
+    states_path — same convention as datasets/wall_dset.py's WallDataset
+    and plan.py's env.update_env(env_info)), so ground-truth replay happens
+    in the same maze the episode was recorded in, not the wrapper's default.
     """
-    wm.eval()
-    actions = torch.tensor(actions_np, dtype=torch.float32, device=device).unsqueeze(0)  # (1,T,action_dim)
-    act_mean = preprocessor.action_mean.to(device).repeat(frameskip)
-    act_std  = preprocessor.action_std.to(device).repeat(frameskip)
+    from env.wall.wall_env_wrapper import WallEnvWrapper
 
-    obs_0 = {"visual": start_img_t, "proprio": start_proprio}
-    with torch.no_grad():
-        acts_norm = (actions - act_mean) / (act_std + 1e-8)
-        z_obses, _ = wm.rollout(obs_0, acts_norm)
-        z_traj = z_obses["visual"]
-        if z_traj.ndim == 4:
-            z_traj = aggregate_visual(wm, z_traj)
-        z_traj = z_traj.squeeze(0).cpu().numpy()  # (T+1, D)
+    data_path = Path(states_path).parent
+    door_locations = torch.load(data_path / "door_locations.pth", map_location="cpu", weights_only=False)
+    wall_locations = torch.load(data_path / "wall_locations.pth", map_location="cpu", weights_only=False)
+    fix_door_location = door_locations[episode_idx][0].item()
+    fix_wall_location = wall_locations[episode_idx][0].item()
 
-    return list(to_pca(z_traj, scaler, ipca, no_pca))
+    env = WallEnvWrapper(
+        fix_wall=True,
+        fix_wall_location=fix_wall_location,
+        fix_door_location=fix_door_location,
+        device=device,
+    )
+    # belt-and-suspenders: also apply via update_env, matching plan.py's
+    # pattern, in case __init__ alone doesn't regenerate wall geometry.
+    env.update_env({
+        "fix_door_location": torch.tensor(fix_door_location),
+        "fix_wall_location": torch.tensor(fix_wall_location),
+    })
+    return env
+
+
+def replay_actions(env, seed, init_state, actions_np, frameskip, action_dim):
+    """
+    Replay a recovered *macro* action sequence — (T, frameskip*action_dim),
+    the WM's own per-step action bundling (see rearrange("b (t f) d -> b t
+    (f d)") in plan.py) — through the actual wall simulator, not the world
+    model. This is ground truth: env.step()'s transition is a deterministic
+    function of (position, action) (see DotWall._generate_transition), so
+    unlike a WM rollout this shows what the recovered actions really do,
+    including wall-collision clamping the WM's smooth latent dynamics can't
+    represent.
+
+    actions_np: (T, frameskip*action_dim) numpy, raw (unnormalised) macro
+                actions, as returned by optimise_rollout/recover_actions.
+    Returns the real (T*frameskip + 1, state_dim) ground-truth state
+    trajectory (including the start state) — already in state-space
+    coordinates, so pass it to plot_rrt_in_state_space via
+    gt_trajectories=, not trajectories= (no encoder/NN lookup needed).
+    """
+    T = actions_np.shape[0]
+    raw_actions = actions_np.reshape(T, frameskip, action_dim).reshape(T * frameskip, action_dim)
+    _, states = env.rollout(seed, np.asarray(init_state), raw_actions)
+    return states  # (T*frameskip + 1, state_dim)
 
 
 # ── Feasibility check ──────────────────────────────────────────────────────
@@ -1008,6 +1032,13 @@ if __name__ == "__main__":
         print(f"action_dim={dset.action_dim}, frameskip={train_cfg.frameskip}, total={action_dim}")
         pca_dim    = wm.encoder.emb_dim if no_pca else ipca.n_components_
 
+        # ground-truth simulator, configured to this episode's actual
+        # door/wall layout — used by replay_actions() below instead of the
+        # world model, so replay reflects real (noise-free-given-actions,
+        # but wall-collision-aware) dynamics rather than the WM's estimate.
+        wall_env = build_wall_env(args.wall_states_path, args.wall_episode_idx, device="cpu")
+        sim_seed = args.wall_episode_idx
+
         # proprio must be (B, T, D) for the encoder, normalised the same way
         # the dataset normalises it before training (raw world coords in,
         # (x - proprio_mean) / proprio_std out) — the encoder never saw raw
@@ -1072,18 +1103,22 @@ if __name__ == "__main__":
     )
     print("Actions to get to goal from rrt states: ", rrt_actions)
 
-    # validate: replay the recovered actions through the WM and compare
-    # against the (subsampled) targets they were optimised to reach.
-    rrt_replayed_pca = replay_actions(
-        wm, start_img_t, make_proprio(start_state), rrt_actions,
-        train_cfg.frameskip, preprocessor, scaler, ipca, no_pca, device,
+    # validate: replay the recovered actions through the real simulator (not
+    # the WM) and compare against the (subsampled) targets they were
+    # optimised to reach — this is ground truth, not a WM self-consistency
+    # check.
+    rrt_replayed_states = replay_actions(
+        wall_env, sim_seed, start_state, rrt_actions,
+        train_cfg.frameskip, dset.action_dim,
     )
     traj_states = plot_rrt_in_state_space(
-        [rrt_path, rrt_target_path, rrt_replayed_pca],
+        [rrt_path, rrt_target_path],
         run_dir=args.run_dir,
         out_dir=args.out_dir,
         filename="rrt_state_space.png",
-        labels=["RRT path (full)", "RRT target (subsampled)", "RRT replayed (recovered actions)"],
+        labels=["RRT path (full)", "RRT target (subsampled)"],
+        gt_trajectories=[rrt_replayed_states],
+        gt_labels=["RRT replayed (ground-truth sim)"],
         k=5)
 
     # ── WM rollout ────────────────────────────────────────────────────────
@@ -1113,19 +1148,22 @@ if __name__ == "__main__":
             margin        = args.sdf_margin,
         )
         # action_seq (from optimise_rollout) already is the recovered action
-        # sequence for rollout_pca — no need to re-derive it. Replay it back
-        # through the WM as a sanity check that rollout_pca is reproducible.
+        # sequence for rollout_pca — no need to re-derive it. Replay it
+        # through the real simulator (ground truth) as a check that
+        # rollout_pca's plan actually does what the WM thinks it does.
         print("Actions to get to goal from wm states: ", action_seq)
-        wm_replayed_pca = replay_actions(
-            wm, start_img_t, make_proprio(start_state), action_seq,
-            train_cfg.frameskip, preprocessor, scaler, ipca, no_pca, device,
+        wm_replayed_states = replay_actions(
+            wall_env, sim_seed, start_state, action_seq,
+            train_cfg.frameskip, dset.action_dim,
         )
         traj_states = plot_rrt_in_state_space(
-            [rollout_pca, wm_replayed_pca],
+            [rollout_pca],
             run_dir=args.run_dir,
             out_dir=args.out_dir,
             filename="wm_state_space.png",
-            labels=["WM optimised rollout", "WM replayed (action_seq)"],
+            labels=["WM optimised rollout"],
+            gt_trajectories=[wm_replayed_states],
+            gt_labels=["WM replayed (ground-truth sim)"],
             k=5)
 
     pred_sdf = from_pca_sdf(np.stack(rollout_pca), sdf, device)
