@@ -147,12 +147,21 @@ def main():
     print(f"Decoded position: {decoded_position}  (error={error:.4f})")
 
     # ── plot ─────────────────────────────────────────────────────────────
+    # shade neighbors by rank: closest = darkest blue, furthest = lightest.
+    # dist is already sorted ascending (KDTree.query returns nearest first),
+    # so rank order doubles as the color order.
+    if dist.max() > dist.min():
+        closeness = 1.0 - (dist - dist.min()) / (dist.max() - dist.min())
+    else:
+        closeness = np.ones_like(dist)
+    nn_colors = plt.cm.Blues(0.25 + 0.65 * closeness)  # keep furthest visibly blue, not white
+
     plt.figure(figsize=(7, 7))
     plt.scatter(S_train[:, 0], S_train[:, 1], s=2, alpha=0.1, color="gray",
                 label="X_train states")
-    plt.scatter(nn_positions[:, 0], nn_positions[:, 1], s=60, color="tab:blue",
+    plt.scatter(nn_positions[:, 0], nn_positions[:, 1], s=60, color=nn_colors,
                 edgecolors="k", linewidths=0.5, zorder=10,
-                label=f"{args.k} nearest-neighbor positions")
+                label=f"{args.k} nearest-neighbor positions\n(darker = closer)")
     plt.scatter(*decoded_position, marker="X", s=250, color="tab:orange",
                 edgecolors="k", linewidths=1.2, zorder=20,
                 label="decoded (k-NN weighted avg)")

@@ -477,10 +477,17 @@ def load_img_tensor(path, img_size, transform, device):
     return img_t.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, C, H, W)
 
 
+def aggregate_visual(wm, z):
+    b, t, p, d = z.shape
+    tokens = z.reshape(b * t, p, d)
+    agg = wm.encoder.agg(tokens)
+    return agg.reshape(b, t, -1)
+
+
 def img_to_latent(wm, img_t, state_gt):
     """
     img_t: (1, 1, C, H, W)
-    Returns z: (1, emb_dim) — CLS or mean-pooled patch token
+    Returns z: (1, emb_dim) — aggregated (agg_mlp) embedding
     """
     obs = {"visual": img_t, "proprio": state_gt}
     with torch.no_grad():
@@ -489,7 +496,7 @@ def img_to_latent(wm, img_t, state_gt):
     z = z_dict["visual"]
     # collapse T and patch dims
     if z.ndim == 4:          # (B, T, patches, D)
-        z = z.mean(dim=2)    # (B, T, D)
+        z = aggregate_visual(wm, z)  # (B, T, agg_out_dim)
     z = z.squeeze(1)         # (B, D)
     return z                 # (1, emb_dim)
 
@@ -516,7 +523,7 @@ def encode_episode_latents(wm, imgs, ep_states, preprocessor, device):
         z_dict = wm.encode_obs(obs)
     z = z_dict["visual"]       # (1, T, patches, D) or (1, T, D)
     if z.ndim == 4:
-        z = z.mean(dim=2)      # (1, T, D)
+        z = aggregate_visual(wm, z)  # (1, T, agg_out_dim)
     return z.squeeze(0).cpu().numpy()  # (T, D)
 
 
@@ -702,7 +709,7 @@ def optimise_rollout(
         # z_obses["visual"]: (1, T, patches, D) or (1, T, D)
         z_traj = z_obses["visual"]
         if z_traj.ndim == 4:
-            z_traj = z_traj.mean(dim=2)   # (1, T, D)
+            z_traj = aggregate_visual(wm, z_traj)   # (1, T, agg_out_dim)
         z_traj = z_traj.squeeze(0)        # (T, D)
         z_final = z_traj[-1:]             # (1, D)
 
@@ -737,7 +744,7 @@ def optimise_rollout(
         z_obses, _ = wm.rollout(obs_0, acts_norm)
         z_traj = z_obses["visual"]
         if z_traj.ndim == 4:
-            z_traj = z_traj.mean(dim=2)
+            z_traj = aggregate_visual(wm, z_traj)
         z_traj = z_traj.squeeze(0).cpu().numpy()  # (T, D)
 
     rollout_pca = list(to_pca(z_traj, scaler, ipca, no_pca))
@@ -760,7 +767,7 @@ def recover_actions(
     device,
     n_iters=300,
     lr=1e-2,
-    max_waypoints=40,
+    max_waypoints=30,
 ):
     """
     Recover an action sequence that reproduces `latent_path` (waypoint 0 is
@@ -823,7 +830,7 @@ def recover_actions(
         z_obses, _ = wm.rollout(obs_0, acts_norm)
         z_traj = z_obses["visual"]
         if z_traj.ndim == 4:
-            z_traj = z_traj.mean(dim=2)
+            z_traj = aggregate_visual(wm, z_traj)
         z_traj = z_traj.squeeze(0)  # (n_steps+1, D)
 
         loss = F.mse_loss(z_traj, targets)
@@ -861,7 +868,7 @@ def replay_actions(
         z_obses, _ = wm.rollout(obs_0, acts_norm)
         z_traj = z_obses["visual"]
         if z_traj.ndim == 4:
-            z_traj = z_traj.mean(dim=2)
+            z_traj = aggregate_visual(wm, z_traj)
         z_traj = z_traj.squeeze(0).cpu().numpy()  # (T+1, D)
 
     return list(to_pca(z_traj, scaler, ipca, no_pca))
@@ -956,8 +963,13 @@ if __name__ == "__main__":
 
     # ── Load SDF ──────────────────────────────────────────────────────────
     print("Loading SDF...")
-    sdf = load_sdf_model(args.sdf_model, device)
-    sdf.eval()
+    _sdf_raw = load_sdf_model(args.sdf_model, device)
+    _sdf_raw.eval()
+    # This model's HKR training convention has X_train_in ("safe") scoring
+    # negative and X_train_out ("unsafe") scoring positive — the opposite of
+    # what rrt()/edge_safe()/optimise_rollout assume (SDF > margin = safe).
+    # Negate once here so every downstream caller sees the expected sign.
+    sdf = lambda x: -_sdf_raw(x)
 
     with open(os.path.join(args.run_dir, "pca_pipeline.pkl"), "rb") as f:
         pca_data = pickle.load(f)
