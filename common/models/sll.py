@@ -2,7 +2,22 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from deel import torchlip
+
+
+class FrobeniusLinear(nn.Module):
+    """Frobenius-normalized linear; exactly 1-Lipschitz when out_features == 1
+    (Frobenius norm == spectral norm for a single row). Drop-in for the former
+    deel.torchlip.FrobeniusLinear, so no torchlip dependency is needed."""
+
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        nn.init.xavier_normal_(self.weight)
+
+    def forward(self, x):
+        return F.linear(x, self.weight / (self.weight.norm() + 1e-12), self.bias)
+
 
 def safe_inv(x):
     mask = x == 0
@@ -48,7 +63,7 @@ def DenseSDP(dim_in, dim_hidden, n_layers):
     layers.append(nn.ZeroPad1d((0, dim_hidden-dim_in)))
     for _ in range(n_layers):
         layers.append(SDPBasedLipschitzDense(dim_hidden))
-    layers.append(torchlip.FrobeniusLinear(dim_hidden,1))
+    layers.append(FrobeniusLinear(dim_hidden,1))
     model = torch.nn.Sequential(*layers)
     model.id = "SDP"
     model.meta = [dim_in, dim_hidden, n_layers]

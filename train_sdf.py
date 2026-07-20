@@ -69,6 +69,10 @@ def get_args():
     parser.add_argument("--ts-ckpt", type=str, default=None)
 
     parser.add_argument("--ts-img-size", type=int, default=224)
+    parser.add_argument("--ts-return-agg", action=argparse.BooleanOptionalAction, default=True,
+                        help="run the trained aggregation head (default); --no-ts-return-agg for raw output")
+    parser.add_argument("--run-tag", type=str, default="",
+                        help="prefix for the run-dir name, e.g. global_ to separate encoders")
     parser.add_argument("--ts-config", type=str, default=None,)
     parser.add_argument("--num-hist", type=int, default=1)
     parser.add_argument("--num-pred", type=int, default=1)
@@ -510,9 +514,9 @@ def run_pca_dim(args, encoder, dataset_source, device, pca_dim, config):
             pca_dim = 2
         else:
             pca_dim  = encoder.output_dim()
-        run_name = f"{args.encoder}_nopca_{args.model}_{args.dataset_mode}"
+        run_name = f"{args.run_tag}{args.encoder}_nopca_{args.model}_{args.dataset_mode}"
     else:
-        run_name = f"{args.encoder}_pca{pca_dim}_{args.model}"
+        run_name = f"{args.run_tag}{args.encoder}_pca{pca_dim}_{args.model}"
 
     out_folder = os.path.join("output", args.output_name, run_name)
     os.makedirs(out_folder, exist_ok=True)
@@ -712,6 +716,7 @@ if __name__ == "__main__":
     elif args.encoder == "ts":
         enc_kwargs["checkpoint_path"] = args.ts_ckpt
         enc_kwargs["img_size"]        = args.ts_img_size
+        enc_kwargs["return_agg"]      = args.ts_return_agg
 
     if args.encoder == "gt_state":
         encoder = None

@@ -43,6 +43,7 @@ def get_args():
     parser.add_argument("--lewm-ckpt", type=str, default=None)
     parser.add_argument("--ts-ckpt", type=str, default=None)
     parser.add_argument("--ts-img-size", type=int, default=224)
+    parser.add_argument("--ts-return-agg", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ts-config", type=str, default=None)
     parser.add_argument("--num-hist", type=int, default=1)
     parser.add_argument("--num-pred", type=int, default=1)
@@ -141,6 +142,7 @@ if __name__ == "__main__":
     elif args.encoder == "ts":
         enc_kwargs["checkpoint_path"] = args.ts_ckpt
         enc_kwargs["img_size"]        = args.ts_img_size
+        enc_kwargs["return_agg"]      = args.ts_return_agg
 
     if args.encoder == "gt-state":
         encoder = None

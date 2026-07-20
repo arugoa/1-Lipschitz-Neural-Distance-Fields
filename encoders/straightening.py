@@ -22,7 +22,12 @@ class TSEncoder(BaseEncoder):
         img_size: int = 224,
         img_mean: tuple = (0.485, 0.456, 0.406),
         img_std:  tuple = (0.229, 0.224, 0.225),
+        return_agg: bool = True,
     ):
+        # return_agg=True runs the trained aggregation head (agg_mlp for the
+        # patch/channel encoder, global-token agg for projglobal). Set False to
+        # take the raw encoder output instead.
+        self.return_agg = return_agg
         import sys, os
         sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.')))
         sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../models')))
@@ -58,7 +63,7 @@ class TSEncoder(BaseEncoder):
         # Probe output dim (use the trained aggregation head, not a naive mean-pool)
         dummy = torch.zeros(1, 3, self.encoder_image_size, self.encoder_image_size).cuda()
         with torch.no_grad():
-            out = self.encoder(dummy, return_agg=True)    # (1, agg_out_dim)
+            out = self.encoder(dummy, return_agg=self.return_agg)    # (1, agg_out_dim)
         self._output_dim = out.shape[-1]
         print(f"StraighteningEncoder: aggregated output {out.shape} → dim {self._output_dim} "
               f"(encoder input resized to {self.encoder_image_size}x{self.encoder_image_size})")
@@ -94,8 +99,13 @@ class TSEncoder(BaseEncoder):
             )
 
         with torch.no_grad():
-            out = self.encoder(imgs_t, return_agg=True)
+            out = self.encoder(imgs_t, return_agg=self.return_agg)
             enc = out
+
+        # projglobal returns (T, 1, D) (singleton token dim); projchannel returns
+        # (T, D). Collapse the singleton so both give (T, D).
+        if enc.dim() == 3 and enc.shape[1] == 1:
+            enc = enc[:, 0, :]
 
         result = enc.cpu().float().numpy()
         del imgs_t, out, enc
