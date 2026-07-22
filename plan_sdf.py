@@ -82,7 +82,7 @@ def get_args():
 
     # RRT
     parser.add_argument("--rrt-iters",   type=int,   default=5000)
-    parser.add_argument("--rrt-step",    type=float, default=0.01)
+    parser.add_argument("--rrt-step",    type=float, default=0.1)
     parser.add_argument("--sdf-margin",  type=float, default=0.001)
     parser.add_argument("--goal-radius", type=float, default=0.01)
 
@@ -91,6 +91,8 @@ def get_args():
     parser.add_argument("--optim-steps",   type=int,   default=300)
     parser.add_argument("--optim-lr",      type=float, default=1e-2)
     parser.add_argument("--safety-weight", type=float, default=1.0)
+    parser.add_argument("--action-reg-weight", type=float, default=10.0,
+                        help="L2 penalty on normalised actions")
     parser.add_argument("--frameskip",     type=int,   default=1)
 
     parser.add_argument("--out-dir", type=str, default="output/planning")
@@ -676,7 +678,7 @@ def optimise_rollout(
     scaler, ipca, no_pca, device,
     rollout_steps, action_dim, frameskip,
     n_optim_steps, lr, safety_weight,
-    preprocessor, margin=0.0,
+    preprocessor, margin=0.0, action_reg_weight=10.0,
 ):
     """
     Optimise an action sequence so wm.rollout reaches goal_latent.
@@ -728,14 +730,18 @@ def optimise_rollout(
             sdf_v = sdf(p_t).squeeze(-1)
             safety_loss = F.relu(margin - sdf_v).mean()
 
-        loss = goal_loss + safety_weight * safety_loss
+        # action regularisation: penalise ||acts_norm||^2
+        action_reg_loss = acts_norm.pow(2).mean()
+
+        loss = goal_loss + safety_weight * safety_loss + action_reg_weight * action_reg_loss
         loss.backward()
         optimizer.step()
 
         if (step + 1) % 50 == 0:
             print(f"  Optim {step+1}/{n_optim_steps}  "
                   f"goal={goal_loss.item():.4f}  "
-                  f"safety={safety_loss.item():.4f}")
+                  f"safety={safety_loss.item():.4f}  "
+                  f"action_reg={action_reg_loss.item():.4f}")
 
     # Extract final trajectory
     with torch.no_grad():
@@ -1027,6 +1033,13 @@ if __name__ == "__main__":
     else:
         print("Loading TS world model...")
         wm, train_cfg = load_ts_model(args.model_path, args.model_epoch, device)
+
+        local_data_path = os.path.dirname(os.path.abspath(os.path.normpath(args.wall_obses_dir)))
+        if train_cfg.env.dataset.data_path != local_data_path:
+            print(f"Overriding dataset data_path: "
+                  f"{train_cfg.env.dataset.data_path} -> {local_data_path}")
+            train_cfg.env.dataset.data_path = local_data_path
+
         preprocessor, dset = load_preprocessor(args.model_path, train_cfg, device)
         action_dim = dset.action_dim * train_cfg.frameskip
         print(f"action_dim={dset.action_dim}, frameskip={train_cfg.frameskip}, total={action_dim}")
@@ -1146,6 +1159,7 @@ if __name__ == "__main__":
             safety_weight = args.safety_weight,
             preprocessor  = preprocessor,
             margin        = args.sdf_margin,
+            action_reg_weight = args.action_reg_weight,
         )
         # action_seq (from optimise_rollout) already is the recovered action
         # sequence for rollout_pca — no need to re-derive it. Replay it
