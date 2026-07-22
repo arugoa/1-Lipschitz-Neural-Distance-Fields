@@ -38,6 +38,14 @@ from sklearn.decomposition import PCA
 #  TS wall dataset episode loading
 # ════════════════════════════════════════════════════════════
 
+def setup_ts_paths():
+    """Add the temporal-straightening repo root + dinov2 hub cache to sys.path."""
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    hub_path = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+    if os.path.exists(hub_path) and hub_path not in sys.path:
+        sys.path.insert(0, hub_path)
+
+
 def load_wall_episode(ts_config_path, split, episode_idx):
     """
     Load one episode from the TS single_wall dataset using hydra.
@@ -124,10 +132,7 @@ def load_encoder(path: str, enc_key: str = "encoder"):
     Load a TS encoder from a checkpoint .pth.
     Sets up sys.path for local TS modules + dinov2 hub cache.
     """
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-    hub_path = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
-    if os.path.exists(hub_path) and hub_path not in sys.path:
-        sys.path.insert(0, hub_path)
+    setup_ts_paths()
 
     obj = torch.load(path, map_location="cpu", weights_only=False)
 
@@ -379,6 +384,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    setup_ts_paths()
 
     imgs, states = load_wall_episode(args.ts_config, args.split, args.episode_idx)
 
