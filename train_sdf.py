@@ -154,6 +154,35 @@ def load_wall_config(config_path):
     return cfg
 
 
+def resolve_wall_geometry(cfg):
+    """
+    Resolve wall-env geometry (img_size, wall_width, door_space,
+    border_wall_loc, ball_radius) used to label 'done'/unsafe states.
+
+    Source of truth = the wall env's own WallDatasetConfig (the config these
+    datasets were generated from). A field explicitly present in cfg.env
+    still wins, so a future dataset with different geometry can override.
+    """
+    try:
+        from env.wall.wall_env_wrapper import DEFAULT_CFG as WALL_CFG
+        base = dict(
+            img_size        = WALL_CFG.img_size,
+            wall_width      = WALL_CFG.wall_width,
+            door_space      = WALL_CFG.door_space,
+            border_wall_loc = WALL_CFG.border_wall_loc,
+            ball_radius     = getattr(WALL_CFG, "ball_radius", 1.0),
+        )
+    except Exception as e:
+        print(f"  [resolve_wall_geometry] env import failed ({e!r}); using literals")
+        base = dict(img_size=65, wall_width=6, door_space=4,
+                    border_wall_loc=5, ball_radius=1.0)
+
+    env_cfg = cfg.env if cfg is not None else {}
+    resolved = {k: env_cfg.get(k, v) for k, v in base.items()}
+    print(f"  wall geometry: {resolved}")
+    return resolved
+
+
 def check_vertical_wall_intersect(pos1, pos2, wall_x, hole_y, door_space):
     check_intersection = (
         torch.sign(pos1[0] - wall_x) * torch.sign(pos2[0] - wall_x)
@@ -438,6 +467,7 @@ class WallDatasetSource:
             door_space      = self.door_half_w,
             border_wall_loc = self.border_wall_loc,
             env_size        = self.env_size,
+            margin          = self.ball_radius,
         ).astype(np.int32)
 
         # trim to same length in case images has an extra frame
@@ -736,17 +766,18 @@ if __name__ == "__main__":
                 "wall_config.pkl"
             )
         cfg = load_wall_config(args.wall_config)
+        geom = resolve_wall_geometry(cfg)
 
         dataset_source = WallDatasetSource(
             obses_dir       = args.wall_obses_dir,
             states_path     = args.wall_states,
             wall_path       = args.wall_locs,
             door_path       = args.door_locs,
-            ball_radius     = cfg.env.get("ball_radius",     1.0),
-            door_half_w     = cfg.env.get("door_space",      4.0),
-            env_size        = cfg.env.get("img_size",        64.0),
-            wall_width      = cfg.env.get("wall_width",      4.0),
-            border_wall_loc = cfg.env.get("border_wall_loc", 2.0),
+            ball_radius     = geom["ball_radius"],
+            door_half_w     = geom["door_space"],
+            env_size        = geom["img_size"],
+            wall_width      = geom["wall_width"],
+            border_wall_loc = geom["border_wall_loc"],
         )
         print(f"Wall dataset: {len(dataset_source)} episodes.")
     elif args.dataset_mode == "ts":
